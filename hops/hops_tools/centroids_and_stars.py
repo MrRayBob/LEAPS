@@ -67,11 +67,14 @@ def two_d_gaussian(x_array, y_array, model_norm, model_floor, model_x_mean, mode
     return model_floor + model_norm * np.exp(-0.5 * (((-xt_array * sinn + yt_array * coss) / model_y_sigma) ** 2 + ((xt_array * coss + yt_array * sinn) / model_x_sigma) ** 2))
 
 
-def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limit, psf, snr=4, search_window=10):
+def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limit, psf, snr=4, search_window=10, fit_effort=1, verbose=False):
 
     star = None
     try:
         # t0 = time.time()
+
+        if verbose == 'deep':
+            print(centroid_x, centroid_y, psf)
 
         bright = data_array[centroid_y][centroid_x]
 
@@ -102,12 +105,15 @@ def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limi
         def function_to_fit(xy_array, model_norm, model_floor, model_x_mean, model_y_mean, model_x_sigma, model_y_sigma, model_theta):
             return two_d_gaussian(datax, datay, model_norm, model_floor, model_x_mean, model_y_mean, model_x_sigma, model_y_sigma, model_theta)
 
-        popt, pcov = plc.curve_fit(function_to_fit, [0], dataz, p0=initials, maxfev=int(1600/(snr**2)),
+        if verbose == 'deep':
+            print('initial: ', initials)
+
+        popt, pcov = plc.curve_fit(function_to_fit, [0], dataz, p0=initials, maxfev=int(fit_effort*1600/(snr**2)),
                                    sigma=datae,
                                    bounds=(np.array(bounds_1), np.array(bounds_2))
                                    )
-
-        # print(popt, pcov)
+        if verbose == 'deep':
+            print('result: ', popt)
 
         # print('2', 1000*(time.time() - t0))
         # t0 = time.time()
@@ -127,14 +133,18 @@ def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limi
                         if np.inf not in [np.sqrt(abs(pcov[ff][ff])) for ff in range(len(pcov) - 1)]:
                             if 0 not in [np.sqrt(abs(pcov[ff][ff])) for ff in range(len(pcov) - 1)]:
                                 star = (popt, pcov)
-            #             else:
-            #                 print('Error not estimated.')
-            #         else:
-            #             print('Error not estimated.')
-            #     else:
-            #         print('Star saturated.')
-            # else:
-            #     print('Low peak')
+                        else:
+                            if verbose == 'deep':
+                                print('Error not estimated.')
+                    else:
+                        if verbose == 'deep':
+                            print('Error not estimated.')
+                else:
+                    if verbose == 'deep':
+                        print('Star saturated.')
+            else:
+                if verbose == 'deep':
+                    print('Low peak')
 
         if popt[5] > popt[4]:
             popt[4], popt[5] = popt[5], popt[4]
@@ -144,7 +154,9 @@ def _star_from_centroid(data_array, centroid_x, centroid_y, mean, std, burn_limi
         # print('3', 1000*(time.time() - t0))
 
     except Exception as e:
-        # print(e)
+        if verbose == 'deep':
+            import traceback
+            print(f'{traceback.format_exc()}')
         pass
 
     return star
@@ -160,13 +172,14 @@ def _get_gaia_stars(ra_0, dec_0, radius, limit=100):
     Gaia.ROW_LIMIT = limit
     Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source"
 
-    query = "SELECT TOP {0} {1} FROM {2} WHERE 1 = CONTAINS(POINT('ICRS', {3}, {4}),CIRCLE('ICRS', ra, dec, {5})) ORDER BY phot_g_mean_mag ASC".format(
+    query = "SELECT TOP {0} {1} FROM {2} WHERE parallax > 0 AND 1 = CONTAINS(POINT('ICRS', {3}, {4}), " \
+            "CIRCLE('ICRS', ra, dec, {5})) ORDER BY phot_g_mean_mag ASC".format(
         limit,
-        'source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag',
+        'source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, parallax, pmra, pmdec',
         Gaia.MAIN_GAIA_TABLE,
         ra_0,
         dec_0,
-        radius
+        radius,
     )
     job = Gaia.launch_job_async(query)
 

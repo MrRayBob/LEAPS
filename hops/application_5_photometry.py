@@ -11,6 +11,7 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 import hops.pylightcurve41 as plc
 from astropy.coordinates import SkyCoord
+from astropy.time import Time as astrotime
 from photutils.aperture import CircularAperture, aperture_photometry
 
 from matplotlib.cm import Greys, Greys_r
@@ -345,6 +346,7 @@ class PhotometryWindow(MainWindow):
             psf=self.fits_header[self.log.psf_key],
             centroids_snr=self.centroids_snr, stars_snr=self.stars_snr,
             order_by_flux=False,
+            verbose=False
         )
 
         if not star:
@@ -703,6 +705,7 @@ class PhotometryWindow(MainWindow):
                 try:
 
                     self.plate_solution = image_plate_solve(self.fits_data, self.fits_header, ra, dec,
+                                                            timestamp=astrotime(self.fits_header[self.log.time_key], format='jd'),
                                                             mean=self.fits_header[self.log.mean_key],
                                                             std=self.fits_header[self.log.std_key],
                                                             burn_limit=self.fits_header[self.log.hops_saturation_key],
@@ -725,6 +728,7 @@ class PhotometryWindow(MainWindow):
                 try:
 
                     self.plate_solution = image_plate_solve(self.fits_data, self.fits_header, ra, dec,
+                                                            timestamp=astrotime(self.fits_header[self.log.time_key], format='jd'),
                                                             mean=self.fits_header[self.log.mean_key],
                                                             std=self.fits_header[self.log.std_key],
                                                             burn_limit=self.fits_header[self.log.hops_saturation_key],
@@ -747,6 +751,7 @@ class PhotometryWindow(MainWindow):
                 try:
 
                     self.plate_solution = image_plate_solve(self.fits_data, self.fits_header, ra, dec,
+                                                            timestamp=astrotime(self.fits_header[self.log.time_key], format='jd'),
                                                             mean=self.fits_header[self.log.mean_key],
                                                             std=self.fits_header[self.log.std_key],
                                                             burn_limit=self.fits_header[self.log.hops_saturation_key],
@@ -1138,7 +1143,7 @@ class PhotometryProgressWindow(MainWindow):
                     std=fits_header[self.log.std_key],
                     burn_limit=fits_header[self.log.hops_saturation_key] * self.saturation,
                     psf=fits_header[self.log.psf_key],
-                    aperture=self.targets_aperture[target] * self.psf_ratio[counter] / fits_header[self.log.psf_key],
+                    absolute_aperture=self.targets_aperture[target] * self.psf_ratio[counter],
                     sky_inner_aperture=self.sky_inner_aperture, sky_outer_aperture=self.sky_outer_aperture,
                     order_by_flux=False,
                     centroids_snr=self.centroids_snr, stars_snr=self.stars_snr
@@ -1247,8 +1252,7 @@ class PhotometryProgressWindow(MainWindow):
                         self.results['aperture_background_error'][target][counter] = sky_flux_unc
                         self.results['aperture_flux'][target][counter] = total_app_flux - sky_flux
                         self.results['aperture_flux_error'][target][counter] = np.sqrt(
-                            np.abs(total_app_flux - sky_flux)/self.camera_gain +
-                            2 * (sky_flux_unc**2))
+                            np.abs(total_app_flux - sky_flux)/self.camera_gain + sky_flux_unc**2)
 
                     except Exception as e:
                         print(e)
