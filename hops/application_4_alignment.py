@@ -329,11 +329,6 @@ class AlignmentWindow(MainWindow):
                                              self.fits_header[self.log.psf_key],
                                              snr=self.centroids_snr)
 
-                self.stars = np.array(self.stars)[:, 1:]
-
-                self.stars = sorted(self.stars, key=lambda x: (x[0]-self.x0)**2 +(x[1]-self.y0)**2)
-
-
                 # self.stars = image_find_stars(self.fits_data, self.fits_header,
                 #                               x_low=self.x0 - self.shift_tolerance,
                 #                               x_upper=self.x0 + self.shift_tolerance,
@@ -352,6 +347,11 @@ class AlignmentWindow(MainWindow):
                 #                               )
 
                 if len(self.stars)>0:
+
+                    self.stars = np.array(self.stars)[:, 1:]
+
+                    self.stars = sorted(self.stars, key=lambda x: (x[0] - self.x0) ** 2 + (x[1] - self.y0) ** 2)
+
                     for star in self.stars:
                         self.settings_to_check.append([star[0], star[1], self.u0, star])
                         if self.rotating_field_mode:
