@@ -15,16 +15,17 @@ from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
-from .ui.main_window import MainWindow
-from .ui.settings_dialog import FirstRunDialog
-from .ui.theme import APP_STYLESHEET, palette
+from leaps import __version__
+from leaps.ui.main_window import MainWindow
+from leaps.ui.settings_dialog import FirstRunDialog
+from leaps.ui.theme import APP_STYLESHEET, palette
 
 
 def create_application(argv: list[str] | None = None) -> QApplication:
     QApplication.setOrganizationName("LEAPS")
     QApplication.setOrganizationDomain("leaps-astronomy.org")
     QApplication.setApplicationName("LEAPS")
-    QApplication.setApplicationVersion("0.1.0")
+    QApplication.setApplicationVersion(__version__)
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, False)
     app = QApplication.instance() or QApplication(argv or sys.argv)
     if sys.platform == "darwin":
