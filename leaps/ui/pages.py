@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from leaps.fits_inventory import FrameRecord
+from leaps.fits_inventory import FITS_EXTENSIONS, FrameRecord
 from leaps.models import LEAPSError, StageEvent, StageID
 
 from .theme import COLORS
@@ -315,6 +315,7 @@ class DataTargetPage(QWidget):
         layout.addStretch()
         outer.addWidget(_scroll_page(body), 1)
         self.records: list[FrameRecord] = []
+        self.file_paths: list[str] = []
         self.assignments: dict[str, list[str]] = {
             key: [] for key in ("science", "bias", "dark", "dark_flat", "flat", "unknown")
         }
@@ -323,6 +324,7 @@ class DataTargetPage(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Choose observing run")
         if folder:
             self.folder.setText(folder)
+            self.preview_folder(Path(folder))
             self.scan_progress.setRange(0, 0)
             self.scan_progress.setVisible(True)
             self.scanRequested.emit(Path(folder))
@@ -330,6 +332,19 @@ class DataTargetPage(QWidget):
     def set_records(self, records: list[FrameRecord]) -> None:
         self.scan_progress.setVisible(False)
         self.records = list(records)
+        self.file_paths = [record.path for record in records]
+        self._refresh_assignments()
+
+    def preview_folder(self, root: Path) -> None:
+        """Populate live counts from filenames before FITS header inspection finishes."""
+        self.file_paths = [
+            path.relative_to(root).as_posix()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+            and path.suffix.casefold() in FITS_EXTENSIONS
+            and ".leaps" not in path.parts
+            and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
+        ]
         self._refresh_assignments()
 
     def set_assignment_patterns(self, patterns: dict[str, str]) -> None:
@@ -348,8 +363,8 @@ class DataTargetPage(QWidget):
             key: [token.strip().casefold() for token in card.classifier.text().split(",") if token.strip()]
             for key, card in self.assignment_cards.items()
         }
-        for record in self.records:
-            stem = Path(record.path).stem.casefold()
+        for path in self.file_paths:
+            stem = Path(path).stem.casefold()
             segments = [segment for segment in re.split(r"[^a-z0-9]+", stem) if segment]
             category = next(
                 (
@@ -359,13 +374,13 @@ class DataTargetPage(QWidget):
                 ),
                 "unknown",
             )
-            assignments[category].append(record.path)
+            assignments[category].append(path)
         self.assignments = assignments
         for key, card in self.assignment_cards.items():
             card.set_count(len(assignments[key]))
         assigned = sum(len(assignments[key]) for key in order)
         unmatched = len(assignments["unknown"])
-        if not self.records:
+        if not self.file_paths:
             self.counts.setText("No FITS files scanned")
         else:
             self.counts.setText(f"{assigned} assigned · {unmatched} unmatched")

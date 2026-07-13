@@ -30,7 +30,7 @@
 ## Verification
 
 - `python3 -m py_compile leaps/*.py leaps/ui/*.py hops/hops_tools/*.py hops/thirdparty/twirl/*.py`
-- `QT_QPA_PLATFORM=offscreen pytest -q`: 16 passed
+- `QT_QPA_PLATFORM=offscreen pytest -q`: 17 passed
 - `pyside6-deploy -c pysidedeploy.spec --dry-run --force`: deployment command generated successfully
 - Offscreen Qt launch and deterministic screenshot: passed
 - Reference versus implementation visual review: passed
