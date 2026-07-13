@@ -1,30 +1,39 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QProcess, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from leaps.catalog import PlanetCatalogResolver
+from leaps.catalog import PlanetCatalogResolver, PlanetParameters
 from leaps.diagnostics import DiagnosticLogger
 from leaps.exports import TransitExporter
-from leaps.fits_inventory import FITSInventory, FrameRecord, validate_coordinates
+from leaps.filters import normalize_filter
+from leaps.fits_inventory import (
+    FITSInventory,
+    FrameRecord,
+    summarize_observation_records,
+    validate_coordinates,
+)
 from leaps.models import (
     LEAPSError,
     ProjectManifest,
@@ -34,12 +43,13 @@ from leaps.models import (
     StageStatus,
     target_fingerprint,
 )
-from leaps.offline import OfflineDataManager
+from leaps.offline import OfflineDataManager, format_bytes
 from leaps.project import ProjectWorkspace
 from leaps.science import (
     AlignmentService,
     FittingService,
     InspectionService,
+    LightCurveReviewService,
     PhotometryConfig,
     PhotometryService,
     PlateSolveService,
@@ -52,6 +62,7 @@ from .pages import (
     ComparisonStarsPage,
     DataTargetPage,
     FittingPage,
+    LightCurvePage,
     ObservingPlannerPage,
     PlateSolvePage,
     ProcessingPage,
@@ -69,27 +80,101 @@ STAGE_LABELS = {
     StageID.INSPECTION: "Inspection",
     StageID.ALIGNMENT: "Alignment",
     StageID.PHOTOMETRY: "Photometry",
+    StageID.LIGHT_CURVE: "Light Curve",
     StageID.FITTING: "Fitting",
 }
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        return None if value in (None, "") else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _start_detached(program: str, arguments: list[str]) -> bool:
+    result = QProcess.startDetached(program, arguments)
+    return bool(result[0] if isinstance(result, tuple) else result)
+
+
+def _reveal_in_file_manager(path: Path) -> None:
+    if sys.platform == "darwin":
+        if not _start_detached("/usr/bin/open", ["-R", str(path)]):
+            raise OSError("Finder could not reveal the preview image")
+        return
+    if sys.platform == "win32":
+        if not _start_detached("explorer.exe", ["/select,", str(path)]):
+            raise OSError("File Explorer could not reveal the preview image")
+        return
+    if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent))):
+        raise OSError("The file manager could not open the preview folder")
+
+
+class ProjectResetDialog(QDialog):
+    def __init__(self, project: ProjectWorkspace, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Reset LEAPS Project Data")
+        self.setModal(True)
+        self.resize(610, 340)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 22)
+        layout.setSpacing(14)
+        title = QLabel("Remove generated project data?")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        layout.addWidget(title)
+        summary = QLabel(
+            "This removes the LEAPS project manifest, logs, caches, checkpoints, and generated "
+            "outputs. Raw FITS and calibration frames remain untouched."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        details = QLabel(
+            f"Project folder: {project.workspace}\n"
+            f"Generated storage: {format_bytes(project.workspace_size())}\n"
+            f"Raw files preserved: {sum(len(paths) for paths in project.manifest.raw_files.values())}"
+        )
+        details.setObjectName("muted")
+        details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        details.setWordWrap(True)
+        layout.addWidget(details)
+        prompt = QLabel(f'Type “{project.manifest.name}” to confirm:')
+        layout.addWidget(prompt)
+        self.confirmation = QLineEdit()
+        self.confirmation.setAccessibleName("Project name confirmation")
+        layout.addWidget(self.confirmation)
+        layout.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.reset_button = buttons.addButton("Reset Project Data", QDialogButtonBox.ButtonRole.DestructiveRole)
+        self.reset_button.setProperty("danger", True)
+        self.reset_button.setEnabled(False)
+        buttons.rejected.connect(self.reject)
+        self.reset_button.clicked.connect(self.accept)
+        self.confirmation.textChanged.connect(
+            lambda value: self.reset_button.setEnabled(value == project.manifest.name)
+        )
+        layout.addWidget(buttons)
 
 
 class MainWindow(QMainWindow):
     projectChanged = Signal(object)
     offlineProgress = Signal(str, object, object)
 
-    def __init__(self, *, demo: bool = False, parent=None) -> None:
+    def __init__(self, *, demo: bool = False, settings: QSettings | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("LEAPS — Exoplanet Transit Analysis")
         self.setMinimumSize(1120, 720)
         self.resize(1440, 960)
-        self.settings = QSettings()
+        self.demo = demo
+        self.settings = settings if settings is not None else QSettings()
         self.project: ProjectWorkspace | None = None
         self.logger: DiagnosticLogger | None = None
         self.records: list[FrameRecord] = []
         self.last_failure: LEAPSError | None = None
+        self._resetting_project = False
         self.runner = TaskRunner(self)
         self.offline_manager = OfflineDataManager(default_offline_root())
         self.target_lookup_runner = TaskRunner(self)
+        self.fitting_lookup_runner = TaskRunner(self)
         self.target_resolver = TargetNameResolver(
             cache_path=self.offline_manager.root / "target-name-cache.json",
             nasa_snapshot=self._nasa_snapshot_path(),
@@ -114,11 +199,11 @@ class MainWindow(QMainWindow):
             self._load_demo_state()
         else:
             recent = self.settings.value("projects/recent", "")
-            if recent and (Path(recent) / ProjectWorkspace.WORKSPACE_NAME / "project.json").exists():
+            if recent and ProjectWorkspace.has_workspace(recent):
                 try:
                     self.set_project(ProjectWorkspace.open(recent))
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    QTimer.singleShot(0, lambda error=exc: self._handle_error(error))
 
     def _build_ui(self) -> None:
         shell = QWidget()
@@ -183,6 +268,7 @@ class MainWindow(QMainWindow):
             ],
         )
         self.plate_page = PlateSolvePage(asset)
+        self.light_curve_page = LightCurvePage()
         self.fitting_page = FittingPage()
         for stage, page in (
             (StageID.DATA_TARGET, self.data_page),
@@ -190,6 +276,7 @@ class MainWindow(QMainWindow):
             (StageID.INSPECTION, self.inspection_page),
             (StageID.ALIGNMENT, self.alignment_page),
             (StageID.PHOTOMETRY, self.plate_page),
+            (StageID.LIGHT_CURVE, self.light_curve_page),
             (StageID.FITTING, self.fitting_page),
         ):
             self.pages[stage] = page
@@ -198,12 +285,6 @@ class MainWindow(QMainWindow):
         self.pages["apertures"] = self.comparison_page
         self.stack.addWidget(self.comparison_page)
         for key, title, subtitle, icon_name in (
-            (
-                "light_curve",
-                "Light Curve",
-                "Inspect normalized flux, uncertainty, and excluded frames across the observing run.",
-                "fa6s.chart-line",
-            ),
             (
                 "diagnostics",
                 "Diagnostics",
@@ -270,7 +351,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(tools_label)
         self.tool_buttons: dict[str, ToolNavButton] = {}
         for key, label, icon_name in (
-            ("light_curve", "Light Curve", "fa6s.chart-line"),
             ("diagnostics", "Diagnostics", "fa6s.stethoscope"),
             ("reports", "Reports", "fa6s.file-lines"),
             ("planner", "Observing Planner", "fa6s.moon"),
@@ -280,18 +360,15 @@ class MainWindow(QMainWindow):
             self.tool_buttons[key] = button
             layout.addWidget(button)
         layout.addStretch()
-        collapse = QPushButton()
-        collapse.setIcon(icon("fa6s.angles-left", COLORS["muted"]))
-        collapse.setToolTip("Collapse the workflow sidebar.")
-        collapse.setFixedSize(38, 34)
-        collapse.setStyleSheet("border: 0; background: transparent;")
-        layout.addWidget(collapse, 0, Qt.AlignmentFlag.AlignRight)
         return sidebar
 
     def _build_status_bar(self) -> QFrame:
         frame = QFrame()
+        frame.setObjectName("statusBar")
         frame.setFixedHeight(68)
-        frame.setStyleSheet(f"background: #081725; border-top: 1px solid {COLORS['border_soft']};")
+        frame.setStyleSheet(
+            "QFrame#statusBar { background: #081725; border: 0; border-top: 1px solid #000000; }"
+        )
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(20, 0, 20, 0)
         self.status_dot = QLabel("●")
@@ -323,6 +400,10 @@ class MainWindow(QMainWindow):
         self.data_page.scanRequested.connect(self.scan_folder)
         self.data_page.saveRequested.connect(self.save_data_target)
         self.data_page.targetLookupRequested.connect(self.resolve_target_name)
+        self.data_page.revealProjectRequested.connect(self.open_project_folder)
+        self.data_page.resetProjectRequested.connect(self.request_project_reset)
+        self.runner.busyChanged.connect(self._runner_busy_changed)
+        self.fitting_lookup_runner.busyChanged.connect(self._runner_busy_changed)
         for page in (self.reduction_page, self.inspection_page, self.alignment_page):
             page.runRequested.connect(self.run_stage)
             page.cancelRequested.connect(self.runner.cancel)
@@ -331,11 +412,20 @@ class MainWindow(QMainWindow):
         self.plate_page.starSelectionRequested.connect(self.select_photometry_star)
         self.plate_page.rankRequested.connect(self.rank_comparison_stars)
         self.plate_page.runRequested.connect(self.run_photometry)
+        self.plate_page.inspector.cancelRequested.connect(self.runner.cancel)
         self.plate_page.selectionChanged.connect(self._save_photometry_selection)
         self.comparison_page.rankRequested.connect(self.rank_comparison_stars)
         self.comparison_page.runRequested.connect(self.run_photometry)
+        self.comparison_page.cancelRequested.connect(self.runner.cancel)
+        self.light_curve_page.selectionChanged.connect(self.review_light_curves)
+        self.light_curve_page.continueRequested.connect(self.confirm_light_curve_review)
         self.fitting_page.previewRequested.connect(lambda values: self.run_fitting(values, full=False))
         self.fitting_page.fullFitRequested.connect(lambda values: self.run_fitting(values, full=True))
+        self.fitting_page.cancelRequested.connect(self.cancel_fitting)
+        self.fitting_page.viewInFilesRequested.connect(self.view_fit_preview_in_files)
+        self.fitting_page.planetSearchRequested.connect(
+            lambda name: self.prepare_fitting_setup(force=True, requested_name=name)
+        )
         self.reports_page.openFolderRequested.connect(self.open_outputs_folder)
         self.reports_page.exportExoClockRequested.connect(lambda: self.export_transit("exoclock"))
         self.reports_page.exportETDRequested.connect(lambda: self.export_transit("etd"))
@@ -368,8 +458,10 @@ class MainWindow(QMainWindow):
         self.project_label.setText("WTS-2 b · 200 science frames")
 
     def set_project(self, project: ProjectWorkspace) -> None:
+        self._recover_interrupted_fitting(project)
         self.project = project
         self.logger = DiagnosticLogger(project)
+        self.fitting_page.reset_setup("Open Fitting to load the selected target and FITS metadata.")
         photometry_stage = project.manifest.stages[StageID.PHOTOMETRY.value]
         if (
             photometry_stage.status == StageStatus.NEEDS_ATTENTION
@@ -377,7 +469,16 @@ class MainWindow(QMainWindow):
         ):
             photometry_stage.status = StageStatus.READY
             photometry_stage.summary = "Select target and comparisons"
-        self.settings.setValue("projects/recent", str(project.root))
+        light_curve_stage = project.manifest.stages[StageID.LIGHT_CURVE.value]
+        if (
+            photometry_stage.status == StageStatus.COMPLETE
+            and light_curve_stage.status == StageStatus.LOCKED
+        ):
+            light_curve_stage.status = StageStatus.READY
+            light_curve_stage.summary = "Review comparison stars"
+            project.save()
+        if not self.demo:
+            self.settings.setValue("projects/recent", str(project.root))
         self.data_page.folder.setText(str(project.root))
         self.data_page.name.setText(project.manifest.target_name)
         self.data_page.ra.setText(project.manifest.target_ra)
@@ -398,10 +499,6 @@ class MainWindow(QMainWindow):
         frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
         if frames:
             self.plate_page.workspace.load_fits(frames[0], pixel_scale)
-        results_figure = project.outputs_dir / StageID.PHOTOMETRY.value / "RESULTS.png"
-        light_curve_page = self.pages.get("light_curve")
-        if results_figure.exists() and isinstance(light_curve_page, SimpleToolPage):
-            light_curve_page.set_image(results_figure)
         fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
         saved_photometry = project.manifest.settings.get("photometry", {})
         if saved_photometry.get("target_fingerprint") == fingerprint:
@@ -451,6 +548,9 @@ class MainWindow(QMainWindow):
         self.project_label.setText(project.manifest.name)
         self.status_text.setText("Session saved")
         self.autosave.setText("autosaved just now")
+        self.data_page.set_project_actions_available(
+            True, busy=self.runner.current is not None or self._resetting_project
+        )
         try:
             import astropy.units as units
             from astropy.coordinates import SkyCoord
@@ -465,6 +565,33 @@ class MainWindow(QMainWindow):
             pass
         self.projectChanged.emit(project)
 
+    @staticmethod
+    def _recover_interrupted_fitting(project: ProjectWorkspace) -> None:
+        state = project.manifest.stages[StageID.FITTING.value]
+        if state.status != StageStatus.RUNNING:
+            return
+        try:
+            project.discard_pending_transaction(StageID.FITTING)
+        except OSError as exc:
+            raise LEAPSError(
+                "FITTING_RECOVERY_FAILED",
+                "The interrupted fit could not be cleaned up",
+                "LEAPS left the previous successful fitting output unchanged.",
+                ["Check access to the LEAPS temporary folder", "Retry opening the project"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
+        project.set_stage(
+            StageID.FITTING,
+            StageStatus.READY,
+            "Interrupted · ready to run again",
+            progress=0.0,
+            checkpoint="interrupted",
+        )
+        if "FITTING_INTERRUPTED" not in state.warning_codes:
+            state.warning_codes.append("FITTING_INTERRUPTED")
+            project.save()
+
     def _apply_manifest(self, manifest: ProjectManifest) -> None:
         for stage, button in self.stage_buttons.items():
             button.update_state(manifest.stages[stage.value])
@@ -473,6 +600,10 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pages[stage])
         for key, button in self.stage_buttons.items():
             button.set_active(key == stage)
+        if stage == StageID.LIGHT_CURVE and self.project:
+            self.review_light_curves()
+        elif stage == StageID.FITTING and self.project:
+            self.prepare_fitting_setup()
 
     def open_tool(self, key: str) -> None:
         self.stack.setCurrentWidget(self.pages[key])
@@ -480,6 +611,9 @@ class MainWindow(QMainWindow):
             button.set_active(False)
 
     def scan_folder(self, root: Path) -> None:
+        if not self._ensure_runner_idle("scan the observing run", StageID.DATA_TARGET):
+            return
+
         def scan(*, emit=None, token=None):
             if token:
                 token.raise_if_cancelled()
@@ -487,7 +621,11 @@ class MainWindow(QMainWindow):
 
         self.status_text.setText("Scanning FITS headers…")
         self.runner.start(
-            scan, result=self._scan_complete, error=self._handle_error, finished=self._scan_finished
+            scan,
+            result=self._scan_complete,
+            error=self._handle_error,
+            finished=self._scan_finished,
+            operation="FITS header scan",
         )
 
     def _nasa_snapshot_path(self) -> Path | None:
@@ -593,24 +731,20 @@ class MainWindow(QMainWindow):
             missing = [
                 kind for kind in ("bias", "dark", "flat") if not grouped[kind] and not values["waivers"][kind]
             ]
-            if missing:
-                names = ", ".join(missing)
-                raise LEAPSError(
-                    "CALIBRATION_CONFIRMATION_REQUIRED",
-                    "Calibration decision required",
-                    f"No {names} frames were found. Add them or explicitly accept the corresponding waiver.",
-                    ["Add calibration frames", "Confirm the waiver"],
-                    stage=StageID.DATA_TARGET,
-                )
+            if missing and not self._confirm_missing_calibration_frames(missing):
+                return
+            for kind in ("bias", "dark", "flat"):
+                values["waivers"][kind] = not grouped[kind]
             root = Path(values["root"])
             project = (
                 ProjectWorkspace.open(root)
-                if (root / ProjectWorkspace.WORKSPACE_NAME / "project.json").exists()
+                if ProjectWorkspace.has_workspace(root)
                 else ProjectWorkspace.create(root, values["target_name"] or root.name)
             )
             previous_fingerprint = target_fingerprint(
                 project.manifest.target_ra, project.manifest.target_dec
             )
+            previous_science = list(project.manifest.raw_files.get("science", []))
             next_fingerprint = target_fingerprint(ra, dec)
             project.manifest.target_name = values["target_name"]
             project.manifest.target_ra = ra
@@ -618,9 +752,21 @@ class MainWindow(QMainWindow):
             project.manifest.raw_files = grouped
             project.manifest.settings["calibration_waivers"] = values["waivers"]
             project.manifest.settings["frame_classifiers"] = values["frame_classifiers"]
+            observation = summarize_observation_records(self.records, grouped["science"])
+            if observation["science_frames_inspected"]:
+                project.manifest.settings["observation_metadata"] = observation
+                if observation["filter"]:
+                    project.manifest.settings["filter"] = observation["filter"]
+                else:
+                    project.manifest.settings.pop("filter", None)
+                if observation["exposure_time"]:
+                    project.manifest.settings["exposure_time"] = observation["exposure_time"]
+            if previous_science != list(grouped["science"]):
+                project.manifest.settings.pop("fitting_setup", None)
             if previous_fingerprint != next_fingerprint:
                 project.manifest.settings.pop("plate_solution", None)
                 project.manifest.settings.pop("photometry", None)
+                project.manifest.settings.pop("fitting_setup", None)
                 alignment = project.manifest.stages[StageID.ALIGNMENT.value]
                 project.manifest.stages[StageID.PHOTOMETRY.value] = StageState(
                     status=(
@@ -634,6 +780,7 @@ class MainWindow(QMainWindow):
                         else "Locked"
                     ),
                 )
+                project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState()
                 project.manifest.stages[StageID.FITTING.value] = StageState()
             project.set_stage(StageID.DATA_TARGET, StageStatus.COMPLETE, "Target selected", progress=1.0)
             self.set_project(project)
@@ -648,6 +795,23 @@ class MainWindow(QMainWindow):
             }.get(failure.code)
             self.data_page.show_error(f"{failure.title}: {failure.message}", section)
 
+    def _confirm_missing_calibration_frames(self, missing: list[str]) -> bool:
+        labels = {"bias": "Bias", "dark": "Darks", "flat": "Flats"}
+        names = ", ".join(labels[kind] for kind in missing)
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Missing calibration frames")
+        dialog.setText(f"No {names} frames are assigned.")
+        dialog.setInformativeText(
+            "Continuing without these calibration frames can reduce the quality of the reduction."
+        )
+        cancel = dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        acknowledge = dialog.addButton("Acknowledge", QMessageBox.ButtonRole.AcceptRole)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return dialog.clickedButton() is acknowledge
+
     def run_stage(self, stage: StageID) -> None:
         if not self.project:
             self._handle_error(
@@ -659,6 +823,8 @@ class MainWindow(QMainWindow):
                     stage=stage,
                 )
             )
+            return
+        if not self._ensure_runner_idle(f"run {STAGE_LABELS[stage]}", stage):
             return
         page = self.pages[stage]
         assert isinstance(page, ProcessingPage)
@@ -680,20 +846,50 @@ class MainWindow(QMainWindow):
             result=lambda result, current_stage=stage: self._stage_complete(current_stage, result),
             error=lambda exc, current_stage=stage: self._stage_failed(current_stage, exc),
             finished=lambda current_page=page: current_page.set_busy(False),
+            operation=STAGE_LABELS[stage],
             **kwargs,
         )
+
+    def _ensure_runner_idle(self, requested: str, stage: StageID | None = None) -> bool:
+        if self.runner.current is None:
+            return True
+        active = self.runner.current_operation or "another operation"
+        self._show_failure(
+            LEAPSError(
+                "OPERATION_IN_PROGRESS",
+                "Another operation is still running",
+                f"LEAPS is finishing {active}. It cannot {requested} at the same time.",
+                ["Wait for the current operation", "Cancel safely, then retry"],
+                stage=stage,
+            )
+        )
+        return False
 
     def _stage_event(self, event: StageEvent) -> None:
         page = self.pages[event.stage]
         if isinstance(page, ProcessingPage):
             page.update_event(event)
+        elif isinstance(page, FittingPage):
+            page.update_event(event)
+            self.status_text.setText(event.message)
         elif event.stage == StageID.PHOTOMETRY:
-            self.plate_page.inspector.banner_title.setText(event.message)
+            title = event.message
+            if event.total > 0:
+                digits = len(str(event.total))
+                title = f"Measuring frame {event.current:0{digits}d} of {event.total}"
+            self.plate_page.inspector.banner_title.setText(title)
+            self.plate_page.inspector.banner_title.setToolTip(event.message)
         if self.project:
             state = self.project.manifest.stages[event.stage.value]
             state.progress = event.fraction
             state.checkpoint = event.checkpoint
             state.summary = event.message
+            if event.stage == StageID.FITTING and (
+                event.current == 0
+                or event.current == event.total
+                or (event.current > 0 and event.current % 100 == 0)
+            ):
+                self.project.save()
 
     def _stage_complete(self, stage: StageID, result: Any) -> None:
         if self.project:
@@ -720,11 +916,7 @@ class MainWindow(QMainWindow):
                 f"color: {COLORS['green']}; font-size: 16px; font-weight: 650;"
             )
             if self.project:
-                results = self.project.outputs_dir / StageID.PHOTOMETRY.value / "RESULTS.png"
-                light_curve_page = self.pages.get("light_curve")
-                if results.exists() and isinstance(light_curve_page, SimpleToolPage):
-                    light_curve_page.set_image(results)
-                    self.open_tool("light_curve")
+                self.open_stage(StageID.LIGHT_CURVE)
 
     def _stage_failed(self, stage: StageID, exc: BaseException) -> None:
         failure = self._as_failure(exc, stage)
@@ -740,6 +932,8 @@ class MainWindow(QMainWindow):
 
     def retry_plate_solve(self) -> None:
         if not self.project:
+            return
+        if not self._ensure_runner_idle("retry plate solving", StageID.PHOTOMETRY):
             return
         frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
         if not frames:
@@ -762,6 +956,7 @@ class MainWindow(QMainWindow):
             event=self._stage_event,
             result=self._plate_complete,
             error=self._plate_failed,
+            operation="plate solving",
         )
 
     def _plate_complete(self, result: Any) -> None:
@@ -854,6 +1049,8 @@ class MainWindow(QMainWindow):
             self._apply_manifest(self.project.manifest)
 
     def select_photometry_star(self, role: str, x: float, y: float) -> None:
+        if not self._ensure_runner_idle("refine another star", StageID.PHOTOMETRY):
+            return
         try:
             frame, _ = self._photometry_inputs(require_target=False)
         except BaseException as exc:
@@ -871,6 +1068,7 @@ class MainWindow(QMainWindow):
             error=self._handle_error,
             finished=lambda: self.status_text.setText("Photometry setup ready"),
             inhibit_sleep=False,
+            operation="star-position refinement",
         )
 
     def _photometry_star_selected(self, role: str, star: dict[str, float]) -> None:
@@ -940,6 +1138,8 @@ class MainWindow(QMainWindow):
         return frames[0], target
 
     def rank_comparison_stars(self) -> None:
+        if not self._ensure_runner_idle("rank comparison stars", StageID.PHOTOMETRY):
+            return
         try:
             frame, target = self._photometry_inputs()
         except BaseException as exc:
@@ -958,9 +1158,12 @@ class MainWindow(QMainWindow):
             result=self.plate_page.set_candidates,
             error=self._handle_error,
             finished=lambda: self.status_text.setText("Comparison ranking ready"),
+            operation="comparison-star ranking",
         )
 
     def run_photometry(self, comparisons: list[tuple[float, float]], radius: float) -> None:
+        if not self._ensure_runner_idle("run photometry", StageID.PHOTOMETRY):
+            return
         try:
             _, target = self._photometry_inputs()
             if not self.project:
@@ -968,6 +1171,10 @@ class MainWindow(QMainWindow):
             assert target is not None
             self._save_photometry_selection(verified=False)
             config = PhotometryConfig(**self.plate_page.inspector.photometry_config())
+            self._set_photometry_busy(True)
+            self.project.manifest.stages[StageID.LIGHT_CURVE.value] = StageState()
+            self.project.manifest.stages[StageID.FITTING.value] = StageState()
+            self.project.manifest.settings.pop("light_curve_review", None)
             self.project.set_stage(StageID.PHOTOMETRY, StageStatus.RUNNING, "Measuring light curve")
             self.runner.start(
                 PhotometryService().run,
@@ -979,10 +1186,217 @@ class MainWindow(QMainWindow):
                 event=self._stage_event,
                 result=lambda result: self._stage_complete(StageID.PHOTOMETRY, result),
                 error=lambda exc: self._stage_failed(StageID.PHOTOMETRY, exc),
+                finished=lambda: self._set_photometry_busy(False),
+                operation="photometry",
             )
             self.comparison_page.status.setText("Photometry is running in the background…")
         except BaseException as exc:
+            self._set_photometry_busy(False)
             self._handle_error(exc)
+
+    def _set_photometry_busy(self, busy: bool) -> None:
+        self.plate_page.inspector.set_busy(busy)
+        self.comparison_page.set_busy(busy)
+
+    def review_light_curves(self, active_comparisons: list[bool] | None = None) -> None:
+        if not self.project:
+            return
+        try:
+            result = LightCurveReviewService().load(
+                self.project, active_comparisons
+            )
+            self.light_curve_page.set_review(result)
+            self.status_text.setText("Light curves ready for review")
+        except BaseException as exc:
+            failure = self._as_failure(exc, StageID.LIGHT_CURVE)
+            self.light_curve_page.show_failure(failure)
+            if active_comparisons is None:
+                self._show_failure(failure)
+
+    def confirm_light_curve_review(self, active_comparisons: list[bool]) -> None:
+        if not self.project:
+            return
+        if not self._ensure_runner_idle(
+            "save the light-curve review", StageID.LIGHT_CURVE
+        ):
+            return
+        try:
+            output = LightCurveReviewService().commit(
+                self.project, active_comparisons
+            )
+            self.project.set_stage(
+                StageID.LIGHT_CURVE,
+                StageStatus.COMPLETE,
+                f"{sum(active_comparisons)} comparisons approved",
+                progress=1.0,
+                output_path=output,
+            )
+            fitting = self.project.manifest.stages[StageID.FITTING.value]
+            fitting.status = StageStatus.READY
+            fitting.summary = (
+                "Ready · previous result preserved"
+                if (self.project.outputs_dir / StageID.FITTING.value).exists()
+                else "Ready"
+            )
+            self.project.save()
+            self._apply_manifest(self.project.manifest)
+            self.status_text.setText("Light curve approved")
+            self.autosave.setText("autosaved just now")
+            self.open_stage(StageID.FITTING)
+        except BaseException as exc:
+            failure = self._as_failure(exc, StageID.LIGHT_CURVE)
+            self.light_curve_page.show_failure(failure)
+            self._show_failure(failure)
+
+    def prepare_fitting_setup(self, *, force: bool = False, requested_name: str = "") -> None:
+        if not self.project or self.fitting_lookup_runner.current is not None:
+            return
+        project = self.project
+        fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
+        cached = project.manifest.settings.get("fitting_setup", {})
+        if not force and cached.get("target_fingerprint") == fingerprint:
+            try:
+                candidates = [PlanetParameters(**values) for values in cached["candidates"]]
+                if candidates:
+                    self._apply_fitting_setup(
+                        project,
+                        candidates,
+                        cached.get("observation", {}),
+                        expected_fingerprint=fingerprint,
+                    )
+                    return
+            except (KeyError, TypeError, ValueError):
+                project.manifest.settings.pop("fitting_setup", None)
+
+        self.fitting_page.set_loading("Matching the selected target and reading science FITS headers…")
+        self.status_text.setText("Preparing fitting setup…")
+        saved_observation = project.manifest.settings.get("observation_metadata", {})
+        assigned_science = list(project.manifest.raw_files.get("science", []))
+        current_records = list(self.records)
+
+        def load(*, emit=None, token=None):
+            resolver = PlanetCatalogResolver(self._nasa_snapshot_path())
+            candidates = resolver.resolve_candidates(
+                project.manifest.target_ra,
+                project.manifest.target_dec,
+                requested_name or project.manifest.target_name,
+            )
+            if not candidates:
+                raise LEAPSError(
+                    "PLANET_NOT_FOUND",
+                    "No planet was found at the project coordinates",
+                    "ExoClock and the available NASA snapshot do not contain a matching planet.",
+                    ["Check Data & Target coordinates", "Update Offline Data", "Press Enter to retry"],
+                    stage=StageID.FITTING,
+                )
+            observation = saved_observation
+            if int(observation.get("science_frames_inspected", 0)) != len(assigned_science):
+                by_path = {record.path: record for record in current_records}
+                records: list[FrameRecord] = []
+                inventory = FITSInventory(project.root)
+                for relative_path in assigned_science:
+                    if token:
+                        token.raise_if_cancelled()
+                    record = by_path.get(relative_path)
+                    if record is None or (not record.filter_name and record.exposure is None):
+                        record = inventory.inspect(project.resolve(relative_path))
+                    records.append(record)
+                observation = summarize_observation_records(records, assigned_science)
+            return candidates, observation
+
+        self.fitting_lookup_runner.start(
+            load,
+            result=lambda payload: self._apply_fitting_setup(
+                project,
+                *payload,
+                expected_fingerprint=fingerprint,
+                preferred_name=requested_name,
+            ),
+            error=self._fitting_setup_failed,
+            finished=lambda: self.status_text.setText("Ready"),
+            inhibit_sleep=False,
+            operation="fitting setup",
+        )
+
+    def _apply_fitting_setup(
+        self,
+        project: ProjectWorkspace,
+        candidates: list[PlanetParameters],
+        observation: dict[str, Any],
+        *,
+        expected_fingerprint: str,
+        preferred_name: str = "",
+    ) -> None:
+        if not self.project or self.project.manifest.project_id != project.manifest.project_id:
+            return
+        fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
+        if fingerprint != expected_fingerprint:
+            return
+        previous = project.manifest.settings.get("fitting_setup", {})
+        latitude = _optional_float(project.manifest.global_profile.get("latitude"))
+        longitude = _optional_float(project.manifest.global_profile.get("longitude"))
+        default_detrending = "airmass" if latitude is not None and longitude is not None else "linear"
+        light_curve = str(previous.get("light_curve", "aperture"))
+        detrending = str(previous.get("detrending", default_detrending))
+        candidate_names = {parameters.name.casefold(): parameters.name for parameters in candidates}
+        selected_name = candidate_names.get(preferred_name.casefold(), "") if preferred_name else ""
+        if not selected_name and not preferred_name:
+            previous_name = str(previous.get("selected_planet", ""))
+            selected_name = candidate_names.get(previous_name.casefold(), "")
+        selected_name = selected_name or candidates[0].name
+        project.manifest.settings["fitting_setup"] = {
+            "target_fingerprint": fingerprint,
+            "selected_planet": selected_name or candidates[0].name,
+            "candidates": [asdict(parameters) for parameters in candidates],
+            "observation": observation,
+            "light_curve": light_curve,
+            "detrending": detrending,
+        }
+        project.manifest.settings["observation_metadata"] = observation
+        detected_filter = normalize_filter(observation.get("filter"))
+        if detected_filter:
+            project.manifest.settings["filter"] = detected_filter
+        if observation.get("exposure_time"):
+            project.manifest.settings["exposure_time"] = float(observation["exposure_time"])
+        project.save()
+        self.fitting_page.set_planet_candidates(candidates, selected_name)
+        self.fitting_page.set_fitting_options(light_curve, detrending)
+        self.fitting_page.set_observation_metadata(
+            str(project.manifest.settings.get("filter", "")) or None,
+            float(project.manifest.settings["exposure_time"])
+            if project.manifest.settings.get("exposure_time")
+            else None,
+            filter_status=str(observation.get("filter_status", "unknown")),
+        )
+        if latitude is None or longitude is None:
+            self.fitting_page.observation_source.setText(
+                self.fitting_page.observation_source.text()
+                + " · observer location not set; Airmass de-trending requires a location"
+            )
+        existing_preview = project.outputs_dir / StageID.FITTING.value / "fit-preview.png"
+        if (
+            existing_preview.exists()
+            and project.manifest.stages[StageID.FITTING.value].status == StageStatus.COMPLETE
+        ):
+            residual_std = None
+            try:
+                summary = json.loads(
+                    (existing_preview.parent / "fit-summary.json").read_text(encoding="utf-8")
+                )
+                residual_std = _optional_float(summary.get("residual_std"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            self.fitting_page.show_preview(
+                existing_preview,
+                planet=selected_name,
+                passband=str(project.manifest.settings.get("filter", "")),
+                residual_std=residual_std,
+            )
+
+    def _fitting_setup_failed(self, exc: BaseException) -> None:
+        failure = self._as_failure(exc, StageID.FITTING)
+        self.fitting_page.show_failure(f"{failure.title}: {failure.message}")
+        self._show_failure(failure)
 
     def run_fitting(self, values: dict[str, Any], *, full: bool) -> None:
         if not self.project:
@@ -996,41 +1410,194 @@ class MainWindow(QMainWindow):
                 )
             )
             return
+        approved_curve = (
+            self.project.outputs_dir
+            / StageID.LIGHT_CURVE.value
+            / "light_curve_aperture.txt"
+        )
+        if (
+            self.project.manifest.stages[StageID.LIGHT_CURVE.value].status
+            != StageStatus.COMPLETE
+            or not approved_curve.exists()
+        ):
+            self._handle_error(
+                LEAPSError(
+                    "LIGHT_CURVE_REVIEW_REQUIRED",
+                    "Review the comparison stars first",
+                    "Fitting uses the approved comparison ensemble from the Light Curve stage.",
+                    ["Open Light Curve", "Confirm at least one comparison star"],
+                    stage=StageID.LIGHT_CURVE,
+                )
+            )
+            return
+        if not self._ensure_runner_idle(
+            "run the full fit" if full else "build a fit preview", StageID.FITTING
+        ):
+            return
+        parameters = values.get("catalog_parameters")
+        if not isinstance(parameters, PlanetParameters):
+            self._handle_error(
+                LEAPSError(
+                    "FITTING_PLANET_REQUIRED",
+                    "Choose a catalogued planet",
+                    "The planet must match the coordinates saved in Data & Target.",
+                    ["Choose a suggested planet", "Press Enter to search again"],
+                    stage=StageID.FITTING,
+                )
+            )
+            return
+        filter_name = normalize_filter(values.get("filter"))
+        if not filter_name:
+            self._handle_error(
+                LEAPSError(
+                    "FITTING_FILTER_REQUIRED",
+                    "Choose the observation filter",
+                    "LEAPS could not translate the selected filter to a HOPS passband.",
+                    ["Choose a filter from the list", "Check the science FITS header"],
+                    stage=StageID.FITTING,
+                )
+            )
+            return
+        exposure_time = self.project.manifest.settings.get("exposure_time")
+        if not exposure_time:
+            self._handle_error(
+                LEAPSError(
+                    "FITTING_EXPOSURE_REQUIRED",
+                    "Science exposure time was not found",
+                    "The assigned science FITS do not provide a usable exposure time.",
+                    ["Return to Data & Target", "Confirm the science frames", "Retry"],
+                    stage=StageID.FITTING,
+                )
+            )
+            return
+
+        parameters = replace(
+            parameters,
+            period=float(values["period"]),
+            mid_time=float(values["mid_time"]),
+            rp_over_rs=max(float(values["depth"]), 0.0) ** 0.5,
+        )
+        profile = self.project.manifest.global_profile
+        latitude = _optional_float(profile.get("latitude"))
+        longitude = _optional_float(profile.get("longitude"))
+        project = self.project
+        setup = project.manifest.settings.get("fitting_setup", {})
+        setup["selected_planet"] = parameters.name
+        setup["light_curve"] = str(values.get("light_curve", "aperture"))
+        setup["detrending"] = str(
+            values.get(
+                "detrending",
+                "airmass" if latitude is not None and longitude is not None else "linear",
+            )
+        )
+        project.manifest.settings["filter"] = filter_name
+        project.manifest.settings["fitting_setup"] = setup
+        project.save()
 
         def fit(*, emit=None, token=None):
             if token:
                 token.raise_if_cancelled()
-            resolver = PlanetCatalogResolver(self.offline_manager.root / "nasa" / "planets.json")
-            parameters = resolver.resolve(
-                self.project.manifest.target_ra, self.project.manifest.target_dec, values["planet"]
-            )
-            parameters = replace(
-                parameters,
-                period=float(values["period"]),
-                mid_time=float(values["mid_time"]),
-                rp_over_rs=max(float(values["depth"]), 0.0) ** 0.5,
-            )
             result = FittingService().run(
-                self.project,
+                project,
                 parameters,
                 full=full,
-                exposure_time=float(self.project.manifest.settings.get("exposure_time", 30.0)),
-                filter_name=str(self.project.manifest.settings.get("filter", "R")),
-                latitude=float(self.project.manifest.global_profile.get("latitude", 0.0)),
-                longitude=float(self.project.manifest.global_profile.get("longitude", 0.0)),
+                exposure_time=float(exposure_time),
+                filter_name=filter_name,
+                latitude=latitude,
+                longitude=longitude,
+                light_curve=setup["light_curve"],
+                detrending=setup["detrending"],
                 iterations=int(values["iterations"]),
                 burn_in=int(values["burn"]),
+                emit=emit,
+                token=token,
             )
             if token:
                 token.raise_if_cancelled()
             return result
 
+        self.fitting_page.set_busy(True, full=full)
+        project.set_stage(
+            StageID.FITTING,
+            StageStatus.RUNNING if full else StageStatus.READY,
+            "Running full fit" if full else "Building preview",
+            progress=0.0,
+        )
+        self._apply_manifest(project.manifest)
         self.status_text.setText("Running full fit…" if full else "Building fit preview…")
         self.runner.start(
             fit,
-            result=lambda result: self._stage_complete(StageID.FITTING, result),
-            error=lambda exc: self._stage_failed(StageID.FITTING, exc),
+            event=self._stage_event,
+            result=self._fitting_complete,
+            error=lambda exc: self._fitting_failed(exc, full=full),
+            finished=lambda: self.fitting_page.set_busy(False),
+            operation="full transit fit" if full else "fit preview",
         )
+
+    def cancel_fitting(self) -> None:
+        if self.runner.current is None:
+            return
+        self.fitting_page.set_stopping()
+        self.status_text.setText("Stopping fit safely…")
+        self.runner.cancel()
+
+    def _fitting_complete(self, result: FittingService.Result) -> None:
+        self.fitting_page.show_preview(
+            result.preview_path,
+            planet=result.planet,
+            passband=result.passband,
+            residual_std=result.residual_std,
+        )
+        if self.project:
+            self.project.set_stage(
+                StageID.FITTING,
+                StageStatus.COMPLETE if result.full else StageStatus.READY,
+                "Complete" if result.full else "Preview ready",
+                progress=1.0 if result.full else 0.5,
+                checkpoint="complete" if result.full else "preview_ready",
+                output_path=result.output_path,
+            )
+            state = self.project.manifest.stages[StageID.FITTING.value]
+            if "FITTING_INTERRUPTED" in state.warning_codes:
+                state.warning_codes.remove("FITTING_INTERRUPTED")
+                self.project.save()
+            self._apply_manifest(self.project.manifest)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Fitting complete" if result.full else "Fit preview ready")
+        self.autosave.setText("autosaved just now")
+
+    def _fitting_failed(self, exc: BaseException, *, full: bool) -> None:
+        failure = self._as_failure(exc, StageID.FITTING)
+        if failure.code == "JOB_CANCELLED":
+            if self.project:
+                self.project.set_stage(
+                    StageID.FITTING,
+                    StageStatus.READY,
+                    "Full fit cancelled" if full else "Preview cancelled",
+                    progress=0.0,
+                    checkpoint="cancelled",
+                )
+                self._apply_manifest(self.project.manifest)
+            message = (
+                "Full fit cancelled. The incomplete attempt was discarded and the previous "
+                "preview and successful results were preserved."
+                if full
+                else "Fit preview cancelled. Existing fitting results were preserved."
+            )
+            self.fitting_page.show_cancelled(message)
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("Full fit cancelled" if full else "Fit preview cancelled")
+            self.autosave.setText("autosaved just now")
+            return
+        if self.project:
+            self.project.set_stage(
+                StageID.FITTING,
+                StageStatus.NEEDS_ATTENTION,
+                "Full fit needs attention" if full else "Preview needs attention",
+            )
+            self._apply_manifest(self.project.manifest)
+        self.fitting_page.show_failure(f"{failure.title}: {failure.message}")
+        self._show_failure(failure)
 
     def _as_failure(self, exc: BaseException, stage: StageID | None = None) -> LEAPSError:
         if self.logger:
@@ -1112,6 +1679,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _download_offline(self, dialog: SettingsDialog) -> None:
+        if not self._ensure_runner_idle("download offline data"):
+            return
         self._settings_dialog = dialog
 
         def download(*, emit=None, token=None):
@@ -1127,6 +1696,7 @@ class MainWindow(QMainWindow):
             result=lambda _: dialog.offline.finish_progress(),
             error=self._handle_error,
             finished=lambda: dialog.offline.download.setEnabled(True),
+            operation="offline-data download",
         )
 
     def _offline_progress(self, label: str, current: int, total: int) -> None:
@@ -1135,10 +1705,18 @@ class MainWindow(QMainWindow):
             dialog.offline.set_progress(label, current, total)
 
     def _refresh_offline(self, dialog: SettingsDialog) -> None:
+        if not self._ensure_runner_idle("refresh offline data"):
+            return
+
         def refresh(*, emit=None, token=None):
             return self.offline_manager.load_remote_manifest()
 
-        self.runner.start(refresh, result=lambda _: dialog.offline.refresh(), error=self._handle_error)
+        self.runner.start(
+            refresh,
+            result=lambda _: dialog.offline.refresh(),
+            error=self._handle_error,
+            operation="offline-data refresh",
+        )
 
     def _remove_offline(self, dialog: SettingsDialog, asset_id: str) -> None:
         self.offline_manager.remove(asset_id)
@@ -1156,6 +1734,128 @@ class MainWindow(QMainWindow):
             )
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.outputs_dir)))
+
+    def open_project_folder(self) -> None:
+        if not self.project:
+            self._handle_error(
+                LEAPSError(
+                    "PROJECT_REQUIRED",
+                    "Open a project first",
+                    "Choose and confirm an observing run before opening its project files.",
+                    ["Open Data & Target"],
+                    stage=StageID.DATA_TARGET,
+                )
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.project.workspace)))
+
+    def view_fit_preview_in_files(self, path: Path) -> None:
+        preview = Path(path)
+        if not preview.is_file():
+            self._handle_error(
+                LEAPSError(
+                    "FIT_PREVIEW_MISSING",
+                    "The fit preview is no longer available",
+                    "The preview image may have been moved or replaced since it was displayed.",
+                    ["Run Preview Fit again"],
+                    stage=StageID.FITTING,
+                    technical_details=str(preview),
+                )
+            )
+            return
+        try:
+            _reveal_in_file_manager(preview)
+        except OSError as exc:
+            self._handle_error(
+                LEAPSError(
+                    "FIT_PREVIEW_REVEAL_FAILED",
+                    "The fit preview could not be shown in files",
+                    "LEAPS could not open the system file manager.",
+                    ["Open the LEAPS fitting output folder manually"],
+                    stage=StageID.FITTING,
+                    technical_details=f"{preview}\n{exc}",
+                )
+            )
+
+    def request_project_reset(self) -> None:
+        if not self.project:
+            return
+        if self.runner.current is not None or self.fitting_lookup_runner.current is not None:
+            self._handle_error(
+                LEAPSError(
+                    "PROJECT_RESET_BUSY",
+                    "Finish the current operation first",
+                    "Project data cannot be reset while LEAPS is processing this run.",
+                    ["Cancel safely and wait for it to finish", "Try reset again"],
+                    stage=StageID.DATA_TARGET,
+                )
+            )
+            return
+        project = self.project
+        dialog = ProjectResetDialog(project, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._resetting_project = True
+        self.data_page.set_project_actions_available(True, busy=True)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Resetting generated project data…")
+
+        def reset(*, emit=None, token=None):
+            if token:
+                token.raise_if_cancelled()
+            return project.delete_generated_data()
+
+        self.runner.start(
+            reset,
+            result=lambda removed: self._project_reset_complete(project.root, int(removed)),
+            error=lambda exc: self._project_reset_failed(project, exc),
+            inhibit_sleep=False,
+            operation="project reset",
+        )
+
+    def _project_reset_complete(self, root: Path, removed_bytes: int) -> None:
+        self._resetting_project = False
+        self._clear_current_project(root)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText(f"Project reset complete · {format_bytes(removed_bytes)} removed")
+
+    def _project_reset_failed(self, project: ProjectWorkspace, exc: BaseException) -> None:
+        self._resetting_project = False
+        failure = self._as_failure(exc, StageID.DATA_TARGET)
+        if not project.workspace.exists():
+            self._clear_current_project(project.root)
+        else:
+            self.data_page.set_project_actions_available(True, busy=False)
+        self._show_failure(failure)
+
+    def _clear_current_project(self, root: Path) -> None:
+        recent = self.settings.value("projects/recent", "")
+        if recent:
+            try:
+                matches = Path(str(recent)).expanduser().resolve() == root.resolve()
+            except OSError:
+                matches = str(recent) == str(root)
+            if matches:
+                self.settings.remove("projects/recent")
+        self.project = None
+        self.logger = None
+        self.records = []
+        self.data_page.clear_session()
+        self.plate_page.clear_selection()
+        self.fitting_page.reset_setup("Open a project to load fitting parameters.")
+        empty = ProjectManifest()
+        self._apply_manifest(empty)
+        self.project_label.clear()
+        self.autosave.setText("No project open")
+        self.open_stage(StageID.DATA_TARGET)
+        self.projectChanged.emit(None)
+
+    def _runner_busy_changed(self, busy: bool) -> None:
+        busy = busy or self.runner.current is not None or self.fitting_lookup_runner.current is not None
+        self.data_page.set_project_actions_available(
+            self.project is not None,
+            busy=busy or self._resetting_project,
+        )
 
     def export_transit(self, format_name: str) -> None:
         if not self.project:
@@ -1190,11 +1890,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.runner.cancel()
         self.target_lookup_runner.cancel()
-        if self.project:
+        self.fitting_lookup_runner.cancel()
+        if self.project and not self._resetting_project:
             self.project.save()
         event.accept()
 
     def autosave_project(self) -> None:
-        if self.project:
+        if self.project and not self._resetting_project:
             self.project.save()
             self.autosave.setText("autosaved just now")

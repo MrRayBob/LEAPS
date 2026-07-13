@@ -4,7 +4,7 @@ LEAPS is a friendly desktop workflow for reducing and analysing exoplanet-transi
 
 The first release focuses on reliability and approachability:
 
-- one resizable window for Data & Target, Reduction, Inspection, Alignment, Photometry, and Fitting;
+- one resizable window for Data & Target, Reduction, Inspection, Alignment, Photometry, Light Curve, and Fitting;
 - coordinates as the canonical target identity, with target name optional;
 - HOPS-style target-name lookup through ExoClock/SIMBAD, with offline NASA and reusable cache fallbacks;
 - automatic FITS frame classification with explicit calibration waivers;
@@ -12,7 +12,8 @@ The first release focuses on reliability and approachability:
 - real reduced-FITS viewing with working pan, zoom, invert, reset, and target/comparison overlays;
 - optional plate solving that validates an existing FITS WCS first, then uses bounded Gaia attempts with a visible timeline and manual target placement fallback;
 - the original HOPS star detection, Gaussian fitting, geometric-centering option, variable aperture, sky-annulus, and differential-photometry calculations behind the new interface;
-- individually reviewable comparison stars plus HOPS-compatible aperture/Gaussian tables, light curves, and FOV/results figures;
+- a required Light Curve review where anomalous comparison stars can be excluded before HOPS-compatible fitting and export;
+- target-coordinate-driven planet defaults, automatic HOPS passband/exposure detection, a rendered Preview Fit gate, and transactional full-fit outputs;
 - typed, recoverable failures and one-click redacted diagnostic ZIP export;
 - offline-data management with size estimates, disk checks, resumable downloads, and project-region Gaia packages;
 - familiar HOPS-compatible outputs plus ExoClock and ETD export surfaces;
@@ -31,7 +32,7 @@ python -m leaps
 
 On Windows, activate the environment with `.venv\Scripts\activate` before running the same install and launch commands.
 
-Raw FITS files are opened read-only. LEAPS creates a portable `.leaps/` workspace beside the observing run containing `project.json`, logs, caches, checkpoints, and generated outputs. Moving the run folder between macOS and Windows preserves relative project references.
+Raw FITS files are opened read-only. LEAPS creates a visible, portable `LEAPS/` folder inside the observing run containing `project.json`, structured logs, caches, checkpoints, and generated outputs. Moving the run folder between macOS and Windows preserves relative project references. Existing hidden `.leaps/` projects are validated and migrated automatically when opened. Data & Target can reveal this folder or safely reset only LEAPS-generated data after exact-name confirmation.
 
 ## Test
 

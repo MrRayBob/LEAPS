@@ -15,5 +15,11 @@ class PyLCProcessError(PyLCError):
     pass
 
 
+class PyLCCancelled(PyLCProcessError):
+    """Raised when a host application requests cooperative cancellation."""
+
+    pass
+
+
 class PyLCInputError(PyLCError):
     pass

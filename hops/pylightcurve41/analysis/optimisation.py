@@ -12,7 +12,7 @@ from scipy.optimize import minimize
 from .distributions import one_d_distribution
 from .statistics import values_to_print, residual_statistics
 
-from ..errors import *
+from ..errors import PyLCCancelled, PyLCInputError, PyLCProcessError
 from ..processes.counter import Counter
 from ..processes.files import save_dict
 from ..plots.plots_fitting import plot_mcmc_corner, plot_mcmc_traces, plot_mcmc_fitting
@@ -38,6 +38,8 @@ class Fitting:
                  scale_uncertainties=False,
                  filter_outliers=False,
                  optimiser='emcee',
+                 progress_callback=None,
+                 cancelled=None,
                  ):
 
         self.input_data_x = np.array(input_data_x, dtype=float)
@@ -98,6 +100,8 @@ class Fitting:
             raise PyLCInputError('Optimiser {0} in not valid. Please choose between '
                              'emcee, scipy_minimize.'.format(optimiser))
         self.optimiser = optimiser
+        self.progress_callback = progress_callback
+        self.cancelled_callback = cancelled
 
         if not walkers:
             self.walkers = 3 * self.dimensions
@@ -171,6 +175,19 @@ class Fitting:
     def _pass(self):
         pass
 
+    def _check_cancelled(self):
+        if self.cancelled_callback and self.cancelled_callback():
+            raise PyLCCancelled('Fitting was cancelled by the host application.')
+
+    def _report_progress(self, phase, current=0, total=0):
+        if self.progress_callback:
+            self.progress_callback(
+                phase,
+                int(current),
+                int(total),
+                {'walkers': self.walkers, 'dimensions': self.dimensions},
+            )
+
     def _internal_model(self, theta):
         parameters = np.ones_like(self.initials) * self.initials
         parameters[self.fitted_parameters_indices] = theta * (self.internal_limits2 - self.internal_limits1) + self.internal_limits1
@@ -185,6 +202,7 @@ class Fitting:
         return self.model(self.input_data_x, *parameters)
 
     def _probability(self, theta):
+        self._check_cancelled()
         if np.prod((0 < theta) * (theta < 1)):
             chi = (self.input_data_y - self._internal_model(theta)) / self.input_data_y_unc
             return -0.5 * (np.sum(chi * chi) +
@@ -193,6 +211,9 @@ class Fitting:
             return -np.inf
 
     def _prefit(self, verbose=False):
+
+        self._check_cancelled()
+        self._report_progress('optimizing_initial_parameters')
 
         if self.scale_uncertainties or self.filter_outliers or self.optimise_initial_parameters:
 
@@ -326,6 +347,9 @@ class Fitting:
 
         if self.optimiser == 'curve_fit':
 
+            self._check_cancelled()
+            self._report_progress('optimizing_initial_parameters')
+
             option = int(bool(self.counter_name))
 
             print(['Running curve_fit...', self.counter_name][option] + '...')
@@ -386,7 +410,8 @@ class Fitting:
 
         elif self.optimiser == 'emcee':
 
-            sys.setrecursionlimit(self.iterations)
+            if self.window_counter:
+                sys.setrecursionlimit(self.iterations)
 
             self.sampler = emcee.EnsembleSampler(self.walkers, self.dimensions, self._probability)
 
@@ -406,12 +431,47 @@ class Fitting:
                 self.root.mainloop()
 
             else:
+                self._emcee_run_headless()
                 self._emcee_run()
 
     def close(self):
         self.exit = True
 
+    def _emcee_run_headless(self):
+        """Run the existing sampler in bounded batches for progress and cancellation."""
+        self._report_progress('sampling', self.progress, self.iterations)
+        while self.progress < self.iterations:
+            self._check_cancelled()
+            batch = min(10, self.iterations - self.progress)
+            if self.progress == 0:
+                try:
+                    self.walkers_initial_positions = np.random.uniform(
+                        (self.internal_initials - 0.5 * self.walkers_spread)[:, None]
+                        * np.ones(self.walkers),
+                        (self.internal_initials + 0.5 * self.walkers_spread)[:, None]
+                        * np.ones(self.walkers),
+                    )
+                    self.walkers_initial_positions = np.swapaxes(
+                        self.walkers_initial_positions, 0, 1
+                    )
+                    self.walkers_initial_positions = np.minimum(
+                        self.walkers_initial_positions, 1
+                    )
+                    self.walkers_initial_positions = np.maximum(
+                        self.walkers_initial_positions, 0
+                    )
+                    self.sampler.run_mcmc(self.walkers_initial_positions, batch)
+                except ValueError:
+                    continue
+            else:
+                self.sampler.run_mcmc(None, batch, skip_initial_state_check=True)
+            self.progress += batch
+            self.counter.update()
+            self._report_progress('sampling', self.progress, self.iterations)
+
     def _emcee_run(self):
+
+        self._check_cancelled()
 
         if self.progress == 0:
             while self.progress == 0:
@@ -466,6 +526,8 @@ class Fitting:
             vars_check = 0
             for var in range(len(self.names)):
 
+                self._check_cancelled()
+
                 if not np.isnan(self.limits1[var]):
                     trace = mcmc_results[self.burn_in:, :, np.where(self.fitted_parameters_indices == var)[0][0]]
                     trace = trace.flatten()
@@ -480,6 +542,8 @@ class Fitting:
             trace_to_analyse = np.where(trace_to_analyse == vars_check)
 
             for var in range(len(self.names)):
+
+                self._check_cancelled()
 
                 if np.isnan(self.limits1[var]):
 
@@ -540,6 +604,8 @@ class Fitting:
             self._postfit()
 
     def _postfit(self):
+
+        self._check_cancelled()
 
         self.results['parameters_final'] = np.array(self.results['parameters_final'])
 

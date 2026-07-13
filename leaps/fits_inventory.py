@@ -4,10 +4,21 @@ import hashlib
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from statistics import median
+from typing import Any
 
+from .filters import normalize_filter
 from .models import LEAPSError, StageID
 
 FITS_EXTENSIONS = {".fits", ".fit", ".fts", ".fz"}
+PROJECT_WORKSPACE_NAMES = {"LEAPS", ".leaps"}
+
+
+def is_generated_project_path(path: Path) -> bool:
+    return any(
+        part in PROJECT_WORKSPACE_NAMES or part.startswith(".LEAPS-reset-")
+        for part in path.parts
+    )
 
 
 @dataclass(slots=True)
@@ -23,6 +34,7 @@ class FrameRecord:
     target_name: str = ""
     target_ra: str = ""
     target_dec: str = ""
+    filter_name: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -105,7 +117,7 @@ class FITSInventory:
             for path in self.root.rglob("*")
             if path.is_file()
             and path.suffix.lower() in FITS_EXTENSIONS
-            and ".leaps" not in path.parts
+            and not is_generated_project_path(path)
             and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
         )
         return [self.inspect(path) for path in paths]
@@ -115,6 +127,7 @@ class FITSInventory:
         shape: tuple[int, ...] | None = None
         bitpix: int | None = None
         exposure: float | None = None
+        filter_name = ""
         try:
             from astropy.io import fits
 
@@ -129,6 +142,15 @@ class FITSInventory:
                     if key in hdu.header:
                         exposure = float(hdu.header[key])
                         break
+                raw_filter = next(
+                    (
+                        hdu.header.get(key)
+                        for key in ("FILTER", "FILT", "FILTER1", "FILTER2")
+                        if hdu.header.get(key) not in (None, "")
+                    ),
+                    "",
+                )
+                filter_name = normalize_filter(raw_filter) or str(raw_filter).strip()
         except Exception:
             pass
         category, confidence, reason = classify_frame(path, header)
@@ -145,6 +167,7 @@ class FITSInventory:
             target_name=target_name,
             target_ra=target_ra,
             target_dec=target_dec,
+            filter_name=filter_name,
         )
 
     @staticmethod
@@ -153,6 +176,41 @@ class FITSInventory:
         for record in records:
             grouped.setdefault(record.category, []).append(record.path)
         return grouped
+
+
+def summarize_observation_records(
+    records: Iterable[FrameRecord], science_paths: Iterable[str] | None = None
+) -> dict[str, Any]:
+    """Summarize the assigned science passband and exposure without reading pixels."""
+    selected = set(science_paths or ())
+    science = [
+        record
+        for record in records
+        if (record.path in selected if selected else record.category == "science")
+    ]
+    filters = {
+        canonical
+        for record in science
+        if (canonical := normalize_filter(record.filter_name)) is not None
+    }
+    exposures = [record.exposure for record in science if record.exposure and record.exposure > 0]
+    if len(filters) == 1:
+        filter_name = next(iter(filters))
+        filter_status = "detected"
+    elif len(filters) > 1:
+        filter_name = None
+        filter_status = "mixed"
+    else:
+        filter_name = None
+        filter_status = "unknown"
+    return {
+        "filter": filter_name,
+        "filter_status": filter_status,
+        "filters_detected": sorted(filters),
+        "exposure_time": float(median(exposures)) if exposures else None,
+        "science_frames_inspected": len(science),
+        "source": "science_fits",
+    }
 
 
 def classify_frame(path: Path, header: dict[str, object]) -> tuple[str, float, str]:

@@ -27,6 +27,7 @@ class StageID(StrEnum):
     INSPECTION = "inspection"
     ALIGNMENT = "alignment"
     PHOTOMETRY = "photometry"
+    LIGHT_CURVE = "light_curve"
     FITTING = "fitting"
 
 
@@ -66,6 +67,7 @@ class StageEvent:
     total: int = 0
     checkpoint: str | None = None
     diagnostic_id: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
     @property
     def fraction(self) -> float:
@@ -109,7 +111,7 @@ class LEAPSError(RuntimeError):
 
 @dataclass(slots=True)
 class ProjectManifest:
-    schema_version: int = 1
+    schema_version: int = 2
     project_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "Untitled transit"
     created_at: str = field(default_factory=utc_now)
@@ -143,6 +145,8 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ProjectManifest:
+        source_version = int(payload.get("schema_version", 1))
+        had_light_curve_stage = StageID.LIGHT_CURVE.value in payload.get("stages", {})
         stages = {
             key: StageState(
                 status=StageStatus(value.get("status", StageStatus.LOCKED)),
@@ -157,7 +161,16 @@ class ProjectManifest:
         }
         known = {field.name for field in cls.__dataclass_fields__.values()}
         values = {key: value for key, value in payload.items() if key in known and key != "stages"}
-        return cls(stages=stages, **values)
+        manifest = cls(stages=stages, **values)
+        if source_version < 2:
+            manifest.schema_version = 2
+            photometry = manifest.stages[StageID.PHOTOMETRY.value]
+            if not had_light_curve_stage and photometry.status == StageStatus.COMPLETE:
+                manifest.stages[StageID.LIGHT_CURVE.value] = StageState(
+                    status=StageStatus.READY,
+                    summary="Review comparison stars",
+                )
+        return manifest
 
     @classmethod
     def load(cls, path: Path) -> ProjectManifest:

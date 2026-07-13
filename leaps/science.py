@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import threading
+import time
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from .catalog import PlanetParameters
+from .filters import normalize_filter, passband_label
 from .models import JobStatus, LEAPSError, StageEvent, StageID
 from .project import ProjectWorkspace
 
@@ -137,9 +139,20 @@ def _emit(
     current: int = 0,
     total: int = 0,
     checkpoint: str | None = None,
+    details: dict[str, Any] | None = None,
 ) -> None:
     if emit:
-        emit(StageEvent(stage, status, message, current, total, checkpoint))
+        emit(
+            StageEvent(
+                stage,
+                status,
+                message,
+                current,
+                total,
+                checkpoint,
+                details=details or {},
+            )
+        )
 
 
 class ReductionService:
@@ -1174,7 +1187,10 @@ class PhotometryService:
 
     @staticmethod
     def _light_curve(
-        rows: list[dict[str, Any]], flux_key: str, error_key: str
+        rows: list[dict[str, Any]],
+        flux_key: str,
+        error_key: str,
+        active_comparisons: list[int] | None = None,
     ) -> np.ndarray:
         times = np.asarray([row["jd"] for row in rows], dtype=float)
         fluxes = np.asarray(
@@ -1185,9 +1201,18 @@ class PhotometryService:
             [[star.get(error_key, float("nan")) for star in row["measurements"]] for row in rows],
             dtype=float,
         )
-        comparison_flux = np.nansum(fluxes[:, 1:], axis=1)
+        comparison_indices = (
+            list(range(1, fluxes.shape[1]))
+            if active_comparisons is None
+            else list(active_comparisons)
+        )
+        if not comparison_indices:
+            raise ValueError("At least one active comparison star is required")
+        comparison_flux = np.nansum(fluxes[:, comparison_indices], axis=1)
         relative = fluxes[:, 0] / comparison_flux
-        comparison_error = np.sqrt(np.nansum(errors[:, 1:] ** 2, axis=1))
+        comparison_error = np.sqrt(
+            np.nansum(errors[:, comparison_indices] ** 2, axis=1)
+        )
         relative_error = np.abs(relative) * np.sqrt(
             (errors[:, 0] / fluxes[:, 0]) ** 2
             + (comparison_error / comparison_flux) ** 2
@@ -1281,7 +1306,320 @@ class PhotometryService:
         results.savefig(destination / "RESULTS.pdf", bbox_inches="tight")
 
 
+class LightCurveReviewService:
+
+    @dataclass(slots=True)
+    class Curve:
+        label: str
+        active: bool
+        aperture: np.ndarray = field(repr=False)
+        gaussian: np.ndarray = field(repr=False)
+        missing_frames: int = 0
+
+    @dataclass(slots=True)
+    class Result:
+        curves: list[LightCurveReviewService.Curve]
+        active_comparisons: list[bool]
+        preview_path: Path
+        frame_count: int
+        rows: list[dict[str, Any]] = field(repr=False)
+
+    def load(
+        self,
+        project: ProjectWorkspace,
+        active_comparisons: list[bool] | None = None,
+        *,
+        destination: Path | None = None,
+    ) -> Result:
+        rows = self._load_rows(project)
+        star_count = len(rows[0]["measurements"])
+        comparison_count = star_count - 1
+        if active_comparisons is None:
+            active_comparisons = self._saved_selection(project, comparison_count)
+        active_comparisons = [bool(value) for value in active_comparisons]
+        if len(active_comparisons) != comparison_count:
+            raise LEAPSError(
+                "LIGHT_CURVE_SELECTION_INVALID",
+                "The comparison selection needs attention",
+                "The saved selection no longer matches the photometry measurements.",
+                ["Review all comparison stars", "Run Photometry again if stars changed"],
+                stage=StageID.LIGHT_CURVE,
+            )
+        if not any(active_comparisons):
+            raise LEAPSError(
+                "LIGHT_CURVE_COMPARISON_REQUIRED",
+                "Keep at least one comparison star",
+                "Differential photometry needs one or more active comparison stars.",
+                ["Enable a comparison star"],
+                stage=StageID.LIGHT_CURVE,
+            )
+
+        times = np.asarray([row["jd"] for row in rows], dtype=float)
+        curves: list[LightCurveReviewService.Curve] = []
+        active_indices = [
+            index + 1 for index, active in enumerate(active_comparisons) if active
+        ]
+        for star_index in range(star_count):
+            is_active = star_index == 0 or active_comparisons[star_index - 1]
+            comparison_indices = (
+                active_indices
+                if star_index == 0
+                else [index for index in active_indices if index != star_index]
+                if is_active
+                else []
+            )
+            aperture = self._individual_curve(
+                rows,
+                times,
+                star_index,
+                comparison_indices,
+                "aperture_flux",
+                "aperture_error",
+            )
+            gaussian = self._individual_curve(
+                rows,
+                times,
+                star_index,
+                comparison_indices,
+                "gaussian_flux",
+                "gaussian_error",
+            )
+            missing = sum(
+                not math.isfinite(
+                    float(row["measurements"][star_index].get("aperture_flux", float("nan")))
+                )
+                for row in rows
+            )
+            curves.append(
+                self.Curve(
+                    label="Target" if star_index == 0 else f"C{star_index}",
+                    active=is_active,
+                    aperture=aperture,
+                    gaussian=gaussian,
+                    missing_frames=missing,
+                )
+            )
+        preview_path = destination or project.temporary_dir / "light-curve-review.png"
+        result = self.Result(
+            curves=curves,
+            active_comparisons=active_comparisons,
+            preview_path=preview_path,
+            frame_count=len(rows),
+            rows=rows,
+        )
+        self._write_preview(result, preview_path)
+        return result
+
+    def commit(
+        self, project: ProjectWorkspace, active_comparisons: list[bool]
+    ) -> Path:
+        result = self.load(project, active_comparisons)
+        active_indices = [
+            index + 1
+            for index, active in enumerate(result.active_comparisons)
+            if active
+        ]
+        aperture = PhotometryService._light_curve(
+            result.rows, "aperture_flux", "aperture_error", active_indices
+        )
+        gaussian = PhotometryService._light_curve(
+            result.rows, "gaussian_flux", "gaussian_error", active_indices
+        )
+        pending, target = project.begin_transaction(StageID.LIGHT_CURVE)
+        try:
+            for filename, curve in (
+                ("light_curve_aperture.txt", aperture),
+                ("PHOTOMETRY_APERTURE.txt", aperture),
+                ("light_curve_gauss.txt", gaussian),
+                ("PHOTOMETRY_GAUSS.txt", gaussian),
+            ):
+                np.savetxt(
+                    pending / filename,
+                    curve,
+                    header="JD_UTC relative_flux relative_flux_uncertainty",
+                )
+            (pending / "review.json").write_text(
+                json.dumps(
+                    {
+                        "active_comparisons": result.active_comparisons,
+                        "active_labels": [
+                            f"C{index + 1}"
+                            for index, active in enumerate(result.active_comparisons)
+                            if active
+                        ],
+                        "frame_count": result.frame_count,
+                        "source": project.relative(
+                            project.outputs_dir
+                            / StageID.PHOTOMETRY.value
+                            / "measurements.json"
+                        ),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            self._write_preview(result, pending / "light-curves.png")
+            project.commit_transaction(pending, target)
+        except BaseException:
+            project.discard_pending_transaction(StageID.LIGHT_CURVE)
+            raise
+        project.manifest.settings["light_curve_review"] = {
+            "active_comparisons": result.active_comparisons
+        }
+        project.save()
+        return target / "light_curve_aperture.txt"
+
+    @staticmethod
+    def _load_rows(project: ProjectWorkspace) -> list[dict[str, Any]]:
+        path = project.outputs_dir / StageID.PHOTOMETRY.value / "measurements.json"
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(rows, list) or len(rows) < 2:
+                raise ValueError("No per-frame measurements were found")
+            star_count = len(rows[0].get("measurements", []))
+            if star_count < 2 or any(
+                len(row.get("measurements", [])) != star_count for row in rows
+            ):
+                raise ValueError("Measurement rows have inconsistent star counts")
+            return rows
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise LEAPSError(
+                "LIGHT_CURVE_MEASUREMENTS_INVALID",
+                "The photometry measurements cannot be reviewed",
+                "The target and comparison-star measurements are missing or incomplete.",
+                ["Run Photometry again", "Export diagnostics if this repeats"],
+                stage=StageID.LIGHT_CURVE,
+                technical_details=f"{path}\n{exc}",
+            ) from exc
+
+    @staticmethod
+    def _saved_selection(project: ProjectWorkspace, count: int) -> list[bool]:
+        saved = project.manifest.settings.get("light_curve_review", {}).get(
+            "active_comparisons", []
+        )
+        return [bool(value) for value in saved] if len(saved) == count else [True] * count
+
+    @staticmethod
+    def _individual_curve(
+        rows: list[dict[str, Any]],
+        times: np.ndarray,
+        star_index: int,
+        comparison_indices: list[int],
+        flux_key: str,
+        error_key: str,
+    ) -> np.ndarray:
+        if not comparison_indices:
+            return np.column_stack(
+                (times, np.full(times.size, np.nan), np.full(times.size, np.nan))
+            )
+        fluxes = np.asarray(
+            [
+                [star.get(flux_key, float("nan")) for star in row["measurements"]]
+                for row in rows
+            ],
+            dtype=float,
+        )
+        errors = np.asarray(
+            [
+                [star.get(error_key, float("nan")) for star in row["measurements"]]
+                for row in rows
+            ],
+            dtype=float,
+        )
+        denominator = np.nansum(fluxes[:, comparison_indices], axis=1)
+        denominator_error = np.sqrt(
+            np.nansum(errors[:, comparison_indices] ** 2, axis=1)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            relative = fluxes[:, star_index] / denominator
+            relative_error = np.abs(relative) * np.sqrt(
+                (errors[:, star_index] / fluxes[:, star_index]) ** 2
+                + (denominator_error / denominator) ** 2
+            )
+        relative[denominator == 0] = np.nan
+        relative_error[denominator == 0] = np.nan
+        normalization = float(np.nanmedian(relative))
+        if not math.isfinite(normalization) or normalization == 0:
+            normalization = 1.0
+        return np.column_stack(
+            (times, relative / normalization, relative_error / normalization)
+        )
+
+    @staticmethod
+    def _write_preview(result: Result, destination: Path) -> None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        height = max(4.5, 1.5 * len(result.curves))
+        figure = Figure(figsize=(10, height), facecolor="#0b2638", constrained_layout=True)
+        FigureCanvasAgg(figure)
+        axes = figure.subplots(len(result.curves), 1, sharex=True, squeeze=False)[:, 0]
+        start = result.curves[0].aperture[0, 0]
+        for index, (axis, curve) in enumerate(zip(axes, result.curves, strict=True)):
+            axis.set_facecolor("#071827")
+            axis.tick_params(colors="#a9bdd0", labelsize=8)
+            axis.grid(color="#28516b", alpha=0.35)
+            for spine in axis.spines.values():
+                spine.set_color("#28516b")
+            axis.set_ylabel(curve.label, color="#dce9f3", rotation=0, labelpad=24)
+            if curve.active and np.any(np.isfinite(curve.aperture[:, 1])):
+                hours = (curve.aperture[:, 0] - start) * 24
+                axis.plot(
+                    hours,
+                    curve.aperture[:, 1],
+                    "o",
+                    color="#20c5f4",
+                    markersize=2.4,
+                    label="Aperture",
+                )
+                axis.plot(
+                    hours,
+                    curve.gaussian[:, 1],
+                    "o",
+                    color="#ffc443",
+                    markersize=2.0,
+                    alpha=0.72,
+                    label="PSF",
+                )
+                if index == 0:
+                    axis.legend(
+                        loc="best",
+                        facecolor="#0b2638",
+                        edgecolor="#28516b",
+                        labelcolor="#dce9f3",
+                    )
+            else:
+                message = (
+                    "Excluded from comparison ensemble"
+                    if not curve.active
+                    else "A second active comparison is needed to plot this star"
+                )
+                axis.text(
+                    0.5,
+                    0.5,
+                    message,
+                    transform=axis.transAxes,
+                    ha="center",
+                    va="center",
+                    color="#71859a",
+                )
+        axes[-1].set_xlabel("Time from first exposure (hours)", color="#dce9f3")
+        figure.savefig(destination, dpi=150, facecolor=figure.get_facecolor())
+
+
 class FittingService:
+
+    @dataclass(slots=True)
+    class Result:
+        full: bool
+        planet: str
+        passband: str
+        preview_path: Path
+        output_path: Path | None
+        residual_std: float | None
+        raw: dict[str, Any] = field(repr=False)
+
     def run(
         self,
         project: ProjectWorkspace,
@@ -1290,17 +1628,130 @@ class FittingService:
         full: bool,
         exposure_time: float,
         filter_name: str,
-        latitude: float,
-        longitude: float,
+        latitude: float | None,
+        longitude: float | None,
+        light_curve: str = "aperture",
+        detrending: str = "automatic",
         iterations: int = 5000,
         burn_in: int = 1000,
-    ) -> dict[str, Any]:
-        import exoclock
+        emit: Emitter | None = None,
+        token: CancellationToken | None = None,
+    ) -> Result:
+        token = token or CancellationToken()
+        started_at = time.monotonic()
+        sampling_started_at: float | None = None
 
-        import hops.pylightcurve41 as plc
+        def report_progress(
+            phase: str,
+            current: int = 0,
+            total: int = 0,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            nonlocal sampling_started_at
+            now = time.monotonic()
+            payload = dict(details or {})
+            payload["phase"] = phase
+            payload["elapsed_seconds"] = max(0.0, now - started_at)
+            if phase == "sampling":
+                if sampling_started_at is None:
+                    sampling_started_at = now
+                sampling_elapsed = max(0.0, now - sampling_started_at)
+                if current > 0 and total > current:
+                    payload["eta_seconds"] = sampling_elapsed * (total - current) / current
+            message = {
+                "preparing_observations": "Preparing observations",
+                "optimizing_initial_parameters": "Optimizing initial parameters",
+                "sampling": "Sampling posterior",
+                "writing_results": "Writing fit results",
+            }.get(phase, "Running full fit")
+            _emit(
+                emit,
+                StageID.FITTING,
+                JobStatus.RUNNING,
+                message,
+                current,
+                total,
+                checkpoint=phase,
+                details=payload,
+            )
 
-        light_curve_path = project.outputs_dir / StageID.PHOTOMETRY.value / "light_curve_aperture.txt"
-        light_curve = np.loadtxt(light_curve_path, unpack=True)
+        def check_cancelled() -> None:
+            if token.cancelled:
+                raise LEAPSError(
+                    "JOB_CANCELLED",
+                    "Fit cancelled",
+                    "The incomplete fitting attempt was discarded. Previous results were preserved.",
+                    ["Run the fit again when ready"],
+                    stage=StageID.FITTING,
+                )
+
+        report_progress("preparing_observations")
+        check_cancelled()
+        filter_name = normalize_filter(filter_name) or filter_name
+        try:
+            import exoclock
+
+            import hops.pylightcurve41 as plc
+        except BaseException as exc:
+            raise LEAPSError(
+                "FITTING_ASSETS_UNAVAILABLE",
+                "The fitting assets are not ready",
+                "PyLightcurve or ExoClock could not be opened for this fit.",
+                ["Open Settings → Offline Data", "Validate or update the fitting data", "Retry"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
+        cancelled_error = getattr(plc, "PyLCCancelled", ())
+
+        light_curve_key = light_curve.strip().casefold()
+        light_curve_files = {
+            "aperture": "light_curve_aperture.txt",
+            "gaussian": "light_curve_gauss.txt",
+        }
+        if light_curve_key not in light_curve_files:
+            raise LEAPSError(
+                "FITTING_LIGHT_CURVE_UNKNOWN",
+                "Choose a valid light curve",
+                "The selected Photometry light curve is not available for fitting.",
+                ["Choose Aperture photometry", "Choose Gaussian photometry"],
+                stage=StageID.FITTING,
+                technical_details=f"Selected light curve: {light_curve}",
+            )
+        light_curve_path = (
+            project.outputs_dir / StageID.LIGHT_CURVE.value / light_curve_files[light_curve_key]
+        )
+        try:
+            light_curve = np.loadtxt(light_curve_path, unpack=True)
+            if light_curve.ndim != 2 or light_curve.shape[0] < 3 or light_curve.shape[1] < 10:
+                raise ValueError("The light curve must contain at least 10 rows and three columns")
+            if not np.all(np.isfinite(light_curve[:3])):
+                raise ValueError("The light curve contains non-finite time, flux, or uncertainty values")
+        except (OSError, ValueError) as exc:
+            raise LEAPSError(
+                "FITTING_LIGHT_CURVE_INVALID",
+                "The photometry light curve cannot be fitted",
+                f"The selected {light_curve_key} light curve is missing or incomplete.",
+                ["Review the Light Curve", "Run Photometry again", "Retry Preview Fit"],
+                stage=StageID.FITTING,
+                technical_details=f"{light_curve_path}\n{exc}",
+            ) from exc
+        if filter_name not in plc.all_filters():
+            raise LEAPSError(
+                "FITTING_FILTER_UNAVAILABLE",
+                "The selected filter is not installed",
+                f"{filter_name} is not available to the HOPS fitting engine.",
+                ["Choose a HOPS-compatible filter", "Validate Offline Data", "Retry Preview Fit"],
+                stage=StageID.FITTING,
+                technical_details=f"Available filters: {', '.join(sorted(plc.all_filters()))}",
+            )
+        if exposure_time <= 0:
+            raise LEAPSError(
+                "FITTING_EXPOSURE_INVALID",
+                "The exposure time needs attention",
+                "A positive science-frame exposure time is required for fitting.",
+                ["Return to Data & Target", "Confirm the science FITS headers", "Retry Preview Fit"],
+                stage=StageID.FITTING,
+            )
         planet = plc.Planet(
             parameters.name,
             exoclock.Hours(parameters.ra).deg(),
@@ -1316,37 +1767,427 @@ class FittingService:
             parameters.periastron,
             parameters.mid_time,
         )
-        planet.add_observation(
-            time=light_curve[0],
-            time_format="JD_UTC",
-            exp_time=exposure_time,
-            time_stamp="start",
-            flux=light_curve[1],
-            flux_unc=light_curve[2],
-            flux_format="flux",
-            filter_name=filter_name,
-            observatory_latitude=latitude,
-            observatory_longitude=longitude,
-            detrending_series="airmass",
-            detrending_order=1,
+        has_observer_location = latitude is not None and longitude is not None
+        detrending_key = detrending.strip().casefold()
+        if detrending_key == "automatic":
+            detrending_key = "airmass" if has_observer_location else "linear"
+        detrending_options = {
+            "airmass": ("airmass", 1),
+            "quadratic": ("time", 2),
+            "linear": ("time", 1),
+        }
+        if detrending_key not in detrending_options:
+            raise LEAPSError(
+                "FITTING_DETRENDING_UNKNOWN",
+                "Choose a valid de-trending method",
+                "The selected de-trending method is not available to the HOPS fitting engine.",
+                ["Choose Airmass, Quadratic, or Linear"],
+                stage=StageID.FITTING,
+                technical_details=f"Selected de-trending method: {detrending}",
+            )
+        if detrending_key == "airmass" and not has_observer_location:
+            raise LEAPSError(
+                "FITTING_AIRMASS_LOCATION_REQUIRED",
+                "Observer location is required for Airmass",
+                "Add the observatory latitude and longitude before using Airmass de-trending.",
+                ["Open Settings", "Choose Linear or Quadratic de-trending"],
+                stage=StageID.FITTING,
+            )
+        detrending_series, detrending_order = detrending_options[detrending_key]
+        pending: Path | None = None
+        target: Path | None = None
+        try:
+            planet.add_observation(
+                time=light_curve[0],
+                time_format="JD_UTC",
+                exp_time=exposure_time,
+                time_stamp="start",
+                flux=light_curve[1],
+                flux_unc=light_curve[2],
+                flux_format="flux",
+                filter_name=filter_name,
+                observatory_latitude=latitude,
+                observatory_longitude=longitude,
+                detrending_series=detrending_series,
+                detrending_order=detrending_order,
+            )
+            if full:
+                pending, target = project.begin_transaction(StageID.FITTING)
+                preview_path = pending / "fit-preview.png"
+            else:
+                preview_path = project.temporary_dir / "fitting-preview.png"
+            result = planet.transit_fitting(
+                output_folder=str(pending) if full else None,
+                scale_uncertainties=True,
+                filter_outliers=True,
+                fit_sma_over_rs=False,
+                fit_inclination=False,
+                counter=None,
+                window_counter=False,
+                iterations=iterations,
+                burn_in=burn_in,
+                optimiser="emcee" if full else "curve_fit",
+                return_traces=full,
+                progress_callback=report_progress,
+                cancelled=lambda: token.cancelled,
+            )
+            check_cancelled()
+            observation = result.get("observations", {}).get("obs0")
+            if not observation:
+                raise ValueError("The fitting engine returned no observation result")
+            predicted_model = planet.transit_integrated(
+                observation["detrended_series"]["time"],
+                float(exposure_time),
+                filter_name,
+            )
+            _write_fit_preview(
+                observation,
+                predicted_model,
+                preview_path,
+                catalog_parameters=parameters,
+                observation_times_jd=light_curve[0],
+                exposure_time=exposure_time,
+                filter_name=filter_name,
+            )
+            check_cancelled()
+            residual_std = observation.get("detrended_statistics", {}).get("res_std")
+            actual_walkers = result.get("settings", {}).get("walkers")
+            summary = {
+                "planet": parameters.name,
+                "source": parameters.source,
+                "source_date": parameters.source_date,
+                "passband": filter_name,
+                "exposure_time": exposure_time,
+                "light_curve": light_curve_key,
+                "detrending": detrending_key,
+                "walkers": actual_walkers,
+                "walker_policy": "hops_auto",
+                "iterations": iterations,
+                "burn_in": burn_in,
+                "residual_std": residual_std,
+                "complete": bool(result),
+                "parameters": asdict(parameters),
+            }
+            if full and pending is not None and target is not None:
+                (pending / "fit-summary.json").write_text(
+                    json.dumps(summary, indent=2), encoding="utf-8"
+                )
+                project.commit_transaction(pending, target)
+                preview_path = target / preview_path.name
+            else:
+                (project.temporary_dir / "fitting-preview.json").write_text(
+                    json.dumps(summary, indent=2), encoding="utf-8"
+                )
+            return self.Result(
+                full=full,
+                planet=parameters.name,
+                passband=filter_name,
+                preview_path=preview_path,
+                output_path=target if full else None,
+                residual_std=float(residual_std) if residual_std is not None else None,
+                raw=result,
+            )
+        except cancelled_error as exc:
+            project.discard_pending_transaction(StageID.FITTING)
+            raise LEAPSError(
+                "JOB_CANCELLED",
+                "Full fit cancelled",
+                "The incomplete fitting attempt was discarded. Previous results were preserved.",
+                ["Run Full Fit again when ready"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
+        except plc.PyLCInputError as exc:
+            project.discard_pending_transaction(StageID.FITTING)
+            raise LEAPSError(
+                "FITTING_INPUT_INVALID",
+                "The fitting setup needs attention",
+                "The HOPS fitting engine rejected one or more observation settings.",
+                ["Review the planet and filter", "Run Preview Fit again", "Export diagnostics if it repeats"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
+        except LEAPSError:
+            project.discard_pending_transaction(StageID.FITTING)
+            raise
+        except BaseException as exc:
+            project.discard_pending_transaction(StageID.FITTING)
+            raise LEAPSError(
+                "FITTING_FAILED",
+                "The fit could not be completed",
+                "LEAPS kept the last successful fitting result unchanged.",
+                ["Run Preview Fit", "Review the fitting setup", "Export diagnostics if it repeats"],
+                stage=StageID.FITTING,
+                technical_details=str(exc),
+            ) from exc
+
+
+def _write_fit_preview(
+    observation: dict[str, Any],
+    predicted_model: Any,
+    destination: Path,
+    *,
+    catalog_parameters: PlanetParameters,
+    observation_times_jd: Any,
+    exposure_time: float,
+    filter_name: str,
+) -> None:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    series = observation["detrended_series"]
+    time = np.asarray(series["time"])
+    flux = np.asarray(series["flux"])
+    uncertainty = np.asarray(series["flux_unc"])
+    model = np.asarray(series["model"])
+    residuals = np.asarray(series["residuals"])
+    predicted = np.asarray(predicted_model, dtype=float)
+    if predicted.ndim != 1 or predicted.shape != time.shape:
+        raise ValueError(
+            "The predicted transit must contain one value for every detrended timestamp"
         )
-        pending, target = project.begin_transaction(StageID.FITTING)
-        result = planet.transit_fitting(
-            output_folder=str(pending) if full else None,
-            scale_uncertainties=True,
-            filter_outliers=True,
-            fit_sma_over_rs=False,
-            fit_inclination=False,
-            counter=None,
-            window_counter=False,
-            iterations=iterations,
-            burn_in=burn_in,
-            optimiser="emcee" if full else "curve_fit",
-        )
-        summary = {"planet": parameters.name, "source": parameters.source, "complete": bool(result)}
-        (pending / "fit-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        project.commit_transaction(pending, target)
-        return result
+    if not np.all(np.isfinite(predicted)):
+        raise ValueError("The predicted transit contains non-finite values")
+
+    best_mid_time = _fit_parameter_result(observation, "mid_time")
+    best_rp_over_rs = _fit_parameter_result(observation, "rp_over_rs")
+    expected_mid_time = _expected_transit_mid_time(
+        observation,
+        time,
+        catalog_parameters.mid_time,
+        catalog_parameters.period,
+    )
+    best_fit_label = (
+        "Best-fit transit\n"
+        rf"$T_{{\mathrm{{mid}}}}={_parameter_math(best_mid_time)}$, "
+        rf"$R_{{\mathrm{{p}}}}/R_\star={_parameter_math(best_rp_over_rs)}$"
+    )
+    timing_offset_minutes = (
+        float(best_mid_time["value"]) - expected_mid_time
+    ) * 24.0 * 60.0
+    timing_minus = _optional_finite_float(best_mid_time.get("m_error"))
+    timing_plus = _optional_finite_float(best_mid_time.get("p_error"))
+    if timing_minus is not None:
+        timing_minus *= 24.0 * 60.0
+    if timing_plus is not None:
+        timing_plus *= 24.0 * 60.0
+    timing_math = _measurement_math(
+        timing_offset_minutes,
+        timing_minus,
+        timing_plus,
+    )
+    predicted_label = (
+        "Predicted transit\n"
+        rf"$T_{{\mathrm{{mid}}}}={expected_mid_time:.8f}$, "
+        rf"$R_{{\mathrm{{p}}}}/R_\star={catalog_parameters.rp_over_rs:.5f}$, "
+        rf"$O\! -\! C={timing_math}\ \mathrm{{min}}$"
+    )
+    observation_header = _fit_preview_header(
+        observation_times_jd,
+        exposure_time,
+        filter_name,
+    )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    offset = float(np.floor(np.min(time)))
+
+    figure = Figure(figsize=(10, 7), facecolor="#0b2638", constrained_layout=True)
+    FigureCanvasAgg(figure)
+    grid = figure.add_gridspec(4, 1, height_ratios=(0.72, 3, 1, 0.12))
+    header = figure.add_subplot(grid[0])
+    curve = figure.add_subplot(grid[1])
+    residual = figure.add_subplot(grid[2], sharex=curve)
+    header.set_axis_off()
+    logo_path = Path(__file__).resolve().parent / "assets" / "leaps-mark.png"
+    if logo_path.exists():
+        from matplotlib.image import imread
+
+        logo_axis = header.inset_axes([0.0, 0.08, 0.075, 0.84])
+        logo_axis.imshow(imread(logo_path))
+        logo_axis.set_axis_off()
+    header.text(
+        0.083,
+        0.62,
+        "LEAPS",
+        transform=header.transAxes,
+        ha="left",
+        va="center",
+        color="#f4f8fb",
+        fontsize=16,
+        fontweight="bold",
+    )
+    header.text(
+        0.083,
+        0.34,
+        "Exoplanet Transit Analysis",
+        transform=header.transAxes,
+        ha="left",
+        va="center",
+        color="#20c5f4",
+        fontsize=7.5,
+    )
+    header.text(
+        0.5,
+        0.53,
+        catalog_parameters.name,
+        transform=header.transAxes,
+        ha="center",
+        va="center",
+        color="#f4f8fb",
+        fontsize=24,
+        fontweight="bold",
+    )
+    header.text(
+        1.0,
+        0.53,
+        observation_header,
+        transform=header.transAxes,
+        ha="right",
+        va="center",
+        color="#dce9f3",
+        fontsize=9.5,
+        linespacing=1.25,
+    )
+    for axis in (curve, residual):
+        axis.set_facecolor("#071827")
+        axis.tick_params(colors="#a9bdd0")
+        for spine in axis.spines.values():
+            spine.set_color("#28516b")
+        axis.grid(color="#28516b", alpha=0.35)
+    curve.errorbar(
+        time - offset,
+        flux,
+        yerr=uncertainty,
+        fmt="o",
+        color="#c4d5e4",
+        ecolor="#52758e",
+        markersize=2.5,
+        linewidth=0.5,
+        label="Observed flux",
+    )
+    curve.plot(
+        time - offset,
+        model,
+        color="#20c5f4",
+        linewidth=1.7,
+        label=best_fit_label,
+        zorder=3,
+    )
+    curve.plot(
+        time - offset,
+        predicted,
+        color="#ff624c",
+        linewidth=1.7,
+        label=predicted_label,
+        zorder=2,
+    )
+    curve.set_ylabel("Relative flux", color="#dce9f3")
+    curve.legend(
+        loc="lower left",
+        facecolor="#0b2638",
+        edgecolor="#28516b",
+        labelcolor="#dce9f3",
+        fontsize=8.2,
+        handlelength=2.8,
+        labelspacing=0.9,
+    )
+    residual.axhline(0, color="#20c5f4", linewidth=1)
+    residual.plot(time - offset, residuals, "o", color="#c4d5e4", markersize=2.5)
+    residual.set_ylabel("Residual", color="#dce9f3")
+    residual.set_xlabel(f"BJD − {offset:.0f}", color="#dce9f3")
+    figure.savefig(destination, dpi=240, facecolor=figure.get_facecolor())
+
+
+def _fit_parameter_result(observation: dict[str, Any], name: str) -> dict[str, Any]:
+    parameter = observation.get("parameters", {}).get(name)
+    if not isinstance(parameter, dict):
+        raise ValueError(f"The fitting result does not contain {name}")
+    value = _optional_finite_float(parameter.get("value"))
+    if value is None:
+        raise ValueError(f"The fitted {name} value is not finite")
+    return parameter
+
+
+def _fit_preview_header(
+    observation_times_jd: Any,
+    exposure_time: float,
+    filter_name: str,
+) -> str:
+    from astropy.time import Time
+
+    times = np.asarray(observation_times_jd, dtype=float)
+    if times.ndim != 1 or times.size == 0 or not np.all(np.isfinite(times)):
+        raise ValueError("The observation times for the fit header are missing or invalid")
+    if not math.isfinite(exposure_time) or exposure_time <= 0:
+        raise ValueError("The exposure time for the fit header must be positive and finite")
+    start_jd = float(np.min(times))
+    end_jd = float(np.max(times)) + exposure_time / 86400.0
+    start = Time(start_jd, format="jd", scale="utc").to_datetime()
+    duration_hours = (end_jd - start_jd) * 24.0
+    return (
+        f"{start:%Y-%m-%d %H:%M} (UT)\n"
+        f"Dur: {duration_hours:.1f}h / Exp: {exposure_time:.1f}s\n"
+        f"Filter: {passband_label(filter_name)}"
+    )
+
+
+def _expected_transit_mid_time(
+    observation: dict[str, Any],
+    time: np.ndarray,
+    catalog_mid_time: float,
+    catalog_period: float,
+) -> float:
+    if not math.isfinite(catalog_mid_time):
+        raise ValueError("The catalog mid-transit time is not finite")
+    if not math.isfinite(catalog_period) or catalog_period <= 0:
+        raise ValueError("The catalog orbital period must be positive and finite")
+    epoch_value = observation.get("model_info", {}).get("epoch")
+    try:
+        epoch = int(epoch_value)
+    except (TypeError, ValueError, OverflowError):
+        epoch = int(round((float(np.mean(time)) - catalog_mid_time) / catalog_period))
+    expected = catalog_mid_time + epoch * catalog_period
+    if not math.isfinite(expected):
+        raise ValueError("The predicted mid-transit time is not finite")
+    return expected
+
+
+def _parameter_math(parameter: dict[str, Any]) -> str:
+    value = float(parameter["value"])
+    minus = _optional_finite_float(parameter.get("m_error"))
+    plus = _optional_finite_float(parameter.get("p_error"))
+    value_text = str(parameter.get("print_value", value))
+    if minus is None or plus is None:
+        return value_text
+    minus_text = str(parameter.get("print_m_error", minus))
+    plus_text = str(parameter.get("print_p_error", plus))
+    return rf"{value_text}^{{+{plus_text}}}_{{-{minus_text}}}"
+
+
+def _measurement_math(
+    value: float,
+    minus: float | None,
+    plus: float | None,
+) -> str:
+    if minus is None or plus is None or minus <= 0 or plus <= 0:
+        return f"{value:.2f}"
+    smallest_error = min(abs(minus), abs(plus))
+    exponent = math.floor(math.log10(smallest_error))
+    leading_digit = int(smallest_error / (10.0**exponent))
+    significant_digits = 2 if leading_digit in (1, 2) else 1
+    decimals = max(0, min(8, -exponent + significant_digits - 1))
+    return (
+        f"{value:.{decimals}f}"
+        rf"^{{+{plus:.{decimals}f}}}_{{-{minus:.{decimals}f}}}"
+    )
+
+
+def _optional_finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _combine(arrays: list[np.ndarray], method: str) -> np.ndarray:

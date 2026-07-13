@@ -75,6 +75,7 @@ class TaskRunner(QObject):
         super().__init__(parent)
         self.pool = QThreadPool.globalInstance()
         self.current: StageWorker | None = None
+        self.current_operation = ""
 
     def start(
         self,
@@ -85,12 +86,14 @@ class TaskRunner(QObject):
         error: Callable[[BaseException], None] | None = None,
         finished: Callable[[], None] | None = None,
         inhibit_sleep: bool = True,
+        operation: str = "Background operation",
         **kwargs: Any,
     ) -> StageWorker:
         if self.current is not None:
             raise RuntimeError("A task is already running")
         worker = StageWorker(function, *args, inhibit_sleep=inhibit_sleep, **kwargs)
         self.current = worker
+        self.current_operation = operation
         if event:
             worker.signals.event.connect(event)
         if result:
@@ -112,4 +115,5 @@ class TaskRunner(QObject):
     @Slot()
     def _finish(self) -> None:
         self.current = None
+        self.current_operation = ""
         self.busyChanged.emit(False)

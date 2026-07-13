@@ -236,7 +236,7 @@ class FirstRunDialog(QDialog):
         layout.addWidget(
             LabelWithInfo(
                 "Project storage",
-                "Raw FITS remain read-only. Each project stores logs, checkpoints, caches, and outputs beside the data.",
+                "Raw FITS remain read-only. Each project stores logs, checkpoints, caches, and outputs in a visible LEAPS folder beside the data.",
             )
         )
         storage = QComboBox()

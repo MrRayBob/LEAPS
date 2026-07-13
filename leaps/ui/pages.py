@@ -4,10 +4,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTime, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -27,7 +29,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from leaps.fits_inventory import FITS_EXTENSIONS, FrameRecord
+from leaps.catalog import PlanetParameters
+from leaps.filters import normalize_filter, passband_choices, passband_label
+from leaps.fits_inventory import FITS_EXTENSIONS, FrameRecord, is_generated_project_path
 from leaps.models import LEAPSError, StageEvent, StageID
 from leaps.targets import ResolvedTarget
 
@@ -41,6 +45,19 @@ def _scroll_page(content: QWidget) -> QScrollArea:
     scroll.setFrameShape(QFrame.Shape.NoFrame)
     scroll.setWidget(content)
     return scroll
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return ""
+    total = max(0, round(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes:d}m {seconds:02d}s"
+    return f"{seconds:d}s"
 
 
 class FrameAssignmentCard(QFrame):
@@ -102,6 +119,8 @@ class DataTargetPage(QWidget):
     scanRequested = Signal(object)
     saveRequested = Signal(dict)
     targetLookupRequested = Signal(str)
+    revealProjectRequested = Signal()
+    resetProjectRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -199,7 +218,7 @@ class DataTargetPage(QWidget):
         row.addWidget(title)
         row.addWidget(
             InfoButton(
-                "LEAPS reads raw FITS files in place. It stores only project state and generated outputs in a portable .leaps folder beside them."
+                "LEAPS reads raw FITS files in place. Project information, logs, and generated outputs are stored in a visible, portable LEAPS folder beside them."
             )
         )
         row.addStretch()
@@ -220,6 +239,31 @@ class DataTargetPage(QWidget):
         self.scan_progress = QProgressBar()
         self.scan_progress.setVisible(False)
         folder_layout.addWidget(self.scan_progress)
+        self.project_actions = QWidget()
+        project_actions_layout = QHBoxLayout(self.project_actions)
+        project_actions_layout.setContentsMargins(0, 6, 0, 0)
+        project_actions_layout.setSpacing(10)
+        self.project_storage = QLabel("Project files: LEAPS/")
+        self.project_storage.setObjectName("muted")
+        project_actions_layout.addWidget(self.project_storage)
+        project_actions_layout.addStretch()
+        self.reveal_project = ActionButton(
+            "Open LEAPS Folder",
+            "fa6s.folder-open",
+            tooltip="Reveal the project manifest, structured logs, checkpoints, caches, and generated outputs.",
+        )
+        self.reveal_project.clicked.connect(self.revealProjectRequested)
+        project_actions_layout.addWidget(self.reveal_project)
+        self.reset_project = ActionButton(
+            "Reset Project Data",
+            "fa6s.trash",
+            tooltip="Remove only LEAPS-generated project information and outputs. Raw FITS frames are never deleted.",
+        )
+        self.reset_project.setProperty("danger", True)
+        self.reset_project.clicked.connect(self.resetProjectRequested)
+        project_actions_layout.addWidget(self.reset_project)
+        self.project_actions.setVisible(False)
+        folder_layout.addWidget(self.project_actions)
         layout.addWidget(folder_card)
         layout.addWidget(target_card)
 
@@ -277,10 +321,12 @@ class DataTargetPage(QWidget):
             ),
         )
         self.assignment_cards: dict[str, FrameAssignmentCard] = {}
+        self.default_classifiers: dict[str, str] = {}
         for index, (key, label, default, icon_name, tip) in enumerate(card_definitions):
             card = FrameAssignmentCard(label, default, icon_name, tip)
             card.classifierChanged.connect(self._refresh_assignments)
             self.assignment_cards[key] = card
+            self.default_classifiers[key] = default
             cards.addWidget(card, index // 2, index % 2)
         cards.setColumnStretch(0, 1)
         cards.setColumnStretch(1, 1)
@@ -292,35 +338,6 @@ class DataTargetPage(QWidget):
         hint.setWordWrap(True)
         hint.setObjectName("muted")
         frames_layout.addWidget(hint)
-        self.bias_waiver = QCheckBox(
-            "Continue without bias frames — my acquisition workflow does not require a separate bias set"
-        )
-        self.dark_waiver = QCheckBox(
-            "Continue without dark frames — I accept the additional calibration risk"
-        )
-        self.flat_waiver = QCheckBox(
-            "Continue without flat frames — I accept uncorrected illumination and dust effects"
-        )
-        waivers_layout = QVBoxLayout()
-        waivers_layout.setContentsMargins(0, 6, 0, 2)
-        waivers_layout.setSpacing(10)
-        for waiver, tip in (
-            (
-                self.bias_waiver,
-                "Required only when no bias frames are assigned. This decision is saved in the project manifest.",
-            ),
-            (
-                self.dark_waiver,
-                "Required only when no dark frames are assigned. This decision is saved in the project manifest.",
-            ),
-            (
-                self.flat_waiver,
-                "Required only when no flat frames are assigned. This decision is saved in the project manifest.",
-            ),
-        ):
-            waiver.setToolTip(tip)
-            waivers_layout.addWidget(waiver)
-        frames_layout.addLayout(waivers_layout)
         layout.addWidget(frames_card)
 
         footer = QHBoxLayout()
@@ -347,6 +364,7 @@ class DataTargetPage(QWidget):
         self.assignments: dict[str, list[str]] = {
             key: [] for key in ("science", "bias", "dark", "dark_flat", "flat", "unknown")
         }
+        self.calibration_waivers = {key: False for key in ("bias", "dark", "flat")}
 
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose observing run")
@@ -449,10 +467,43 @@ class DataTargetPage(QWidget):
             for path in sorted(root.rglob("*"))
             if path.is_file()
             and path.suffix.casefold() in FITS_EXTENSIONS
-            and ".leaps" not in path.parts
+            and not is_generated_project_path(path)
             and not any(part.startswith("reduction") or part.startswith("photometry") for part in path.parts)
         ]
         self._refresh_assignments()
+
+    def set_project_actions_available(self, available: bool, *, busy: bool = False) -> None:
+        self.project_actions.setVisible(available)
+        self.reveal_project.setEnabled(available)
+        self.reset_project.setEnabled(available and not busy)
+
+    def clear_session(self) -> None:
+        self.target_lookup_timer.stop()
+        self.folder.clear()
+        self.name.clear()
+        self.ra.clear()
+        self.dec.clear()
+        self.target_source.clear()
+        self.target_source.setVisible(False)
+        self.target_lookup_status.setText("Enter a name to look up coordinates automatically.")
+        self.target_lookup_status.setStyleSheet("")
+        self._lookup_requested_name = ""
+        self._lookup_coordinate_snapshot = ("", "")
+        self._last_resolved_coordinates = None
+        self.records = []
+        self.file_paths = []
+        for key, default in self.default_classifiers.items():
+            editor = self.assignment_cards[key].classifier
+            blocked = editor.blockSignals(True)
+            editor.setText(default)
+            editor.blockSignals(blocked)
+        self.calibration_waivers = {key: False for key in ("bias", "dark", "flat")}
+        self._set_assignments(
+            {key: [] for key in ("science", "bias", "dark", "dark_flat", "flat", "unknown")}
+        )
+        self.scan_progress.setVisible(False)
+        self.clear_section_errors()
+        self.set_project_actions_available(False)
 
     def set_assignment_patterns(self, patterns: dict[str, str]) -> None:
         for key, value in patterns.items():
@@ -479,9 +530,9 @@ class DataTargetPage(QWidget):
         self.records = []
         self._set_assignments(restored)
         decisions = waivers or {}
-        self.bias_waiver.setChecked(bool(decisions.get("bias", False)))
-        self.dark_waiver.setChecked(bool(decisions.get("dark", False)))
-        self.flat_waiver.setChecked(bool(decisions.get("flat", False)))
+        self.calibration_waivers = {
+            key: bool(decisions.get(key, False)) for key in ("bias", "dark", "flat")
+        }
 
     def assignment_patterns(self) -> dict[str, str]:
         return {key: card.classifier.text().strip() for key, card in self.assignment_cards.items()}
@@ -531,11 +582,7 @@ class DataTargetPage(QWidget):
                 "target_name": self.name.text().strip(),
                 "ra": self.ra.text().strip(),
                 "dec": self.dec.text().strip(),
-                "waivers": {
-                    "bias": self.bias_waiver.isChecked(),
-                    "dark": self.dark_waiver.isChecked(),
-                    "flat": self.flat_waiver.isChecked(),
-                },
+                "waivers": dict(self.calibration_waivers),
                 "assignments": {key: list(paths) for key, paths in self.assignments.items()},
                 "frame_classifiers": self.assignment_patterns(),
             }
@@ -630,7 +677,7 @@ class ProcessingPage(QWidget):
         actions = QHBoxLayout()
         actions.addStretch()
         self.cancel = ActionButton(
-            "Cancel safely",
+            "Cancel",
             "fa6s.stop",
             tooltip="Stop after the current safe checkpoint. Completed outputs remain intact.",
         )
@@ -650,6 +697,8 @@ class ProcessingPage(QWidget):
         outer.addWidget(_scroll_page(body), 1)
 
     def set_busy(self, busy: bool) -> None:
+        self.run.set_running(busy, f"Running {self.stage.value.replace('_', ' ').title()}…")
+        self.cancel.set_cancel_active(busy)
         self.run.setEnabled(not busy)
         self.cancel.setEnabled(busy)
 
@@ -709,6 +758,7 @@ class RecoveryInspector(QFrame):
     comparisonRequested = Signal()
     rankRequested = Signal()
     runRequested = Signal(list, float)
+    cancelRequested = Signal()
     copyRequested = Signal()
     comparisonActiveChanged = Signal(int, bool)
     comparisonRemoved = Signal(int)
@@ -736,6 +786,10 @@ class RecoveryInspector(QFrame):
         self.banner_icon.setPixmap(icon("fa6s.crosshairs", COLORS["cyan"]).pixmap(24, 24))
         self.banner_title = QLabel("Photometry setup")
         self.banner_title.setStyleSheet(f"color: {COLORS['cyan']}; font-size: 16px; font-weight: 650;")
+        self.banner_title.setMinimumWidth(0)
+        self.banner_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         banner_layout.addWidget(self.banner_icon)
         banner_layout.addWidget(self.banner_title, 1)
         layout.addWidget(self.banner)
@@ -953,9 +1007,18 @@ class RecoveryInspector(QFrame):
             primary=True,
             tooltip="Track the selected stars and calculate aperture and Gaussian light curves in the background.",
         )
+        self._busy = False
         self.run.setEnabled(False)
         self.run.clicked.connect(self._run)
+        self.cancel = ActionButton(
+            "Cancel",
+            "fa6s.stop",
+            tooltip="Stop after the current safe checkpoint. Completed outputs remain intact.",
+        )
+        self.cancel.setEnabled(False)
+        self.cancel.clicked.connect(self.cancelRequested)
         content.addWidget(self.run)
+        content.addWidget(self.cancel)
         content.addWidget(self.copy)
         content.addStretch()
         scroll = QScrollArea()
@@ -1053,9 +1116,17 @@ class RecoveryInspector(QFrame):
 
     def _update_run_state(self) -> None:
         self.run.setEnabled(
-            "not selected" not in self.target_selection.text()
+            not self._busy
+            and "not selected" not in self.target_selection.text()
             and not self.comparison_selection.text().startswith("Comparisons: 0 active")
         )
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.run.set_running(busy, "Running Photometry…")
+        self.cancel.set_cancel_active(busy)
+        self.cancel.setEnabled(busy)
+        self._update_run_state()
 
     def _run(self) -> None:
         self.runRequested.emit([], self.aperture.value())
@@ -1272,9 +1343,178 @@ class PlateSolvePage(QWidget):
         self.inspector.set_comparisons([], [])
 
 
+class LightCurvePage(QWidget):
+    selectionChanged = Signal(list)
+    continueRequested = Signal(list)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._preview_pixmap = QPixmap()
+        self._updating = False
+        self.comparison_checks: list[QCheckBox] = []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(
+            PageHeader(
+                "Light Curve",
+                "Review the target and comparison-star curves, exclude anomalous comparisons, then continue to fitting.",
+            )
+        )
+        body = QWidget()
+        layout = QHBoxLayout(body)
+        layout.setContentsMargins(26, 24, 26, 28)
+        layout.setSpacing(18)
+
+        controls = QFrame()
+        controls.setObjectName("card")
+        controls.setMinimumWidth(275)
+        controls.setMaximumWidth(350)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(18, 16, 18, 18)
+        heading = QHBoxLayout()
+        title = QLabel("Active stars")
+        title.setObjectName("sectionTitle")
+        heading.addWidget(title)
+        heading.addWidget(
+            InfoButton(
+                "The target is always retained. Uncheck comparison stars whose light curves show trends, jumps, or unusual scatter."
+            )
+        )
+        heading.addStretch()
+        controls_layout.addLayout(heading)
+        self.summary = QLabel("Run Photometry to generate the individual light curves.")
+        self.summary.setObjectName("muted")
+        self.summary.setWordWrap(True)
+        controls_layout.addWidget(self.summary)
+        self.selection_widget = QWidget()
+        self.selection_layout = QVBoxLayout(self.selection_widget)
+        self.selection_layout.setContentsMargins(0, 8, 0, 8)
+        self.selection_layout.setSpacing(10)
+        controls_layout.addWidget(self.selection_widget)
+        controls_layout.addStretch()
+        self.message = QLabel()
+        self.message.setObjectName("muted")
+        self.message.setWordWrap(True)
+        controls_layout.addWidget(self.message)
+        self.continue_button = ActionButton(
+            "Continue to Fitting",
+            "fa6s.arrow-right",
+            primary=True,
+            tooltip="Save the active comparison ensemble and build the approved light curve used by Fitting and exports.",
+        )
+        self.continue_button.setEnabled(False)
+        self.continue_button.clicked.connect(
+            lambda: self.continueRequested.emit(self.active_comparisons())
+        )
+        controls_layout.addWidget(self.continue_button)
+        layout.addWidget(controls)
+
+        plot_card = QFrame()
+        plot_card.setObjectName("card")
+        plot_layout = QVBoxLayout(plot_card)
+        plot_layout.setContentsMargins(18, 16, 18, 18)
+        plot_title = QHBoxLayout()
+        label = QLabel("Differential light curves")
+        label.setObjectName("sectionTitle")
+        plot_title.addWidget(label)
+        plot_title.addWidget(
+            InfoButton(
+                "Target is divided by the active comparison ensemble. Each active comparison is divided by the other active comparisons, matching HOPS."
+            )
+        )
+        plot_title.addStretch()
+        plot_layout.addLayout(plot_title)
+        self.preview_image = QLabel("Individual light curves will appear here after Photometry.")
+        self.preview_image.setObjectName("muted")
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setMinimumSize(520, 420)
+        self.preview_image.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        plot_layout.addWidget(self.preview_image, 1)
+        layout.addWidget(plot_card, 1)
+        outer.addWidget(body, 1)
+
+    def set_review(self, result: Any) -> None:
+        self._updating = True
+        while self.selection_layout.count():
+            item = self.selection_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.comparison_checks = []
+        target = QCheckBox("Target")
+        target.setChecked(True)
+        target.setEnabled(False)
+        target.setToolTip("The target star is always included.")
+        self.selection_layout.addWidget(target)
+        for index, active in enumerate(result.active_comparisons, start=1):
+            checkbox = QCheckBox(f"C{index}")
+            checkbox.setChecked(bool(active))
+            checkbox.setAccessibleName(f"Use comparison star C{index}")
+            checkbox.setToolTip(
+                f"Include C{index} in the comparison ensemble used for the target light curve."
+            )
+            checkbox.toggled.connect(self._selection_toggled)
+            self.comparison_checks.append(checkbox)
+            self.selection_layout.addWidget(checkbox)
+        self._updating = False
+        self._preview_pixmap = QPixmap(str(result.preview_path))
+        self._render_preview()
+        self.summary.setText(
+            f"{result.frame_count} frames · {sum(result.active_comparisons)} of "
+            f"{len(result.active_comparisons)} comparisons active"
+        )
+        failed = [
+            f"{curve.label}: {curve.missing_frames} missing"
+            for curve in result.curves
+            if curve.missing_frames
+        ]
+        self.message.setText(" · ".join(failed) if failed else "All selected stars were measured in every frame.")
+        self.continue_button.setEnabled(bool(result.active_comparisons))
+
+    def active_comparisons(self) -> list[bool]:
+        return [checkbox.isChecked() for checkbox in self.comparison_checks]
+
+    def _selection_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        if not checked and not any(self.active_comparisons()):
+            checkbox = self.sender()
+            if isinstance(checkbox, QCheckBox):
+                checkbox.blockSignals(True)
+                checkbox.setChecked(True)
+                checkbox.blockSignals(False)
+            self.message.setText("At least one comparison star must remain active.")
+            return
+        self.selectionChanged.emit(self.active_comparisons())
+
+    def show_failure(self, failure: LEAPSError) -> None:
+        self.message.setText(f"{failure.title}: {failure.message}")
+        self.continue_button.setEnabled(False)
+
+    def _render_preview(self) -> None:
+        if self._preview_pixmap.isNull():
+            return
+        self.preview_image.setPixmap(
+            self._preview_pixmap.scaled(
+                self.preview_image.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._render_preview()
+
+
 class FittingPage(QWidget):
     previewRequested = Signal(dict)
     fullFitRequested = Signal(dict)
+    planetSearchRequested = Signal(str)
+    cancelRequested = Signal()
+    viewInFilesRequested = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1295,25 +1535,58 @@ class FittingPage(QWidget):
         form_card.setObjectName("card")
         form_layout = QVBoxLayout(form_card)
         form_layout.setContentsMargins(18, 16, 18, 18)
+        selection_form = QFormLayout()
+        selection_form.setSpacing(10)
+        self.light_curve = QComboBox()
+        self.light_curve.addItem("Aperture photometry", "aperture")
+        self.light_curve.addItem("Gaussian photometry", "gaussian")
+        selection_form.addRow(
+            LabelWithInfo(
+                "Light curve",
+                "Choose which approved Light Curve output to fit. Aperture photometry preserves LEAPS' existing default.",
+            ),
+            self.light_curve,
+        )
+        form_layout.addLayout(selection_form)
         title = QLabel("Planet parameters")
         title.setObjectName("sectionTitle")
         form_layout.addWidget(title)
         form = QFormLayout()
         form.setSpacing(10)
-        self.planet = QLineEdit()
-        self.planet.setPlaceholderText("WTS-2 b")
+        self._parameters: dict[str, PlanetParameters] = {}
+        self._preview_valid = False
+        self._busy = False
+        self._preview_pixmap = QPixmap()
+        self._rendered_preview_pixmap = QPixmap()
+        self._preview_path: Path | None = None
+        self.planet = QComboBox()
+        self.planet.setEditable(True)
+        self.planet.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.planet.setPlaceholderText("Loading from the selected target…")
+        self.planet.lineEdit().returnPressed.connect(
+            lambda: self.planetSearchRequested.emit(self.planet.currentText().strip())
+        )
         self.period = QDoubleSpinBox()
         self.period.setDecimals(8)
         self.period.setRange(0.000001, 100000)
-        self.period.setValue(1.0187068)
         self.mid_time = QDoubleSpinBox()
         self.mid_time.setDecimals(8)
         self.mid_time.setRange(0, 4_000_000)
-        self.mid_time.setValue(2461220.42)
         self.depth = QDoubleSpinBox()
         self.depth.setDecimals(5)
         self.depth.setRange(0, 1)
-        self.depth.setValue(0.03)
+        self.filter = QComboBox()
+        self.filter.setEditable(True)
+        self.filter.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for label, identifier in passband_choices():
+            self.filter.addItem(label, identifier)
+        self.filter.setCurrentIndex(-1)
+        self.filter.setPlaceholderText("Detecting from science FITS…")
+        self.detrending = QComboBox()
+        self.detrending.addItem("Airmass", "airmass")
+        self.detrending.addItem("Quadratic", "quadratic")
+        self.detrending.addItem("Linear", "linear")
+        self.detrending.setCurrentIndex(self.detrending.findData("linear"))
         form.addRow(
             LabelWithInfo(
                 "Planet",
@@ -1330,7 +1603,64 @@ class FittingPage(QWidget):
             LabelWithInfo("Expected depth", "Approximate fractional loss of light during transit."),
             self.depth,
         )
+        form.addRow(
+            LabelWithInfo(
+                "Observation filter",
+                "Detected from the assigned science FITS headers and translated to the original HOPS passband name.",
+            ),
+            self.filter,
+        )
+        form.addRow(
+            LabelWithInfo(
+                "De-trending",
+                "Remove a trend using airmass, a quadratic time curve, or a linear time curve. LEAPS keeps its existing automatic default.",
+            ),
+            self.detrending,
+        )
         form_layout.addLayout(form)
+
+        metadata_layout = QVBoxLayout()
+        metadata_layout.setContentsMargins(0, 4, 0, 4)
+        metadata_layout.setSpacing(10)
+
+        catalog_card = QFrame()
+        catalog_card.setObjectName("fittingMetadataCard")
+        catalog_card.setStyleSheet(
+            f"QFrame#fittingMetadataCard {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        catalog_layout = QVBoxLayout(catalog_card)
+        catalog_layout.setContentsMargins(12, 10, 12, 11)
+        catalog_layout.setSpacing(5)
+        catalog_title = QLabel("Catalog")
+        catalog_title.setObjectName("eyebrow")
+        catalog_layout.addWidget(catalog_title)
+        self.catalog_source = QLabel("Planet parameters have not been loaded.")
+        self.catalog_source.setObjectName("muted")
+        self.catalog_source.setWordWrap(True)
+        self.catalog_source.setMinimumHeight(36)
+        self.catalog_source.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        catalog_layout.addWidget(self.catalog_source)
+        metadata_layout.addWidget(catalog_card)
+
+        observation_card = QFrame()
+        observation_card.setObjectName("fittingMetadataCard")
+        observation_card.setStyleSheet(
+            f"QFrame#fittingMetadataCard {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        observation_layout = QVBoxLayout(observation_card)
+        observation_layout.setContentsMargins(12, 10, 12, 11)
+        observation_layout.setSpacing(5)
+        observation_title = QLabel("Observation")
+        observation_title.setObjectName("eyebrow")
+        observation_layout.addWidget(observation_title)
+        self.observation_source = QLabel("Science-frame metadata has not been loaded.")
+        self.observation_source.setObjectName("muted")
+        self.observation_source.setWordWrap(True)
+        self.observation_source.setMinimumHeight(54)
+        self.observation_source.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        observation_layout.addWidget(self.observation_source)
+        metadata_layout.addWidget(observation_card)
+        form_layout.addLayout(metadata_layout)
         self.advanced_toggle = QPushButton("Advanced MCMC controls")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.setToolTip(
@@ -1339,18 +1669,12 @@ class FittingPage(QWidget):
         form_layout.addWidget(self.advanced_toggle)
         self.advanced = QWidget()
         advanced_form = QFormLayout(self.advanced)
-        self.walkers = QSpinBox()
-        self.walkers.setRange(20, 1000)
-        self.walkers.setValue(100)
         self.iterations = QSpinBox()
         self.iterations.setRange(100, 1_000_000)
         self.iterations.setValue(5000)
         self.burn = QSpinBox()
         self.burn.setRange(0, 900_000)
         self.burn.setValue(1000)
-        advanced_form.addRow(
-            LabelWithInfo("Walkers", "Independent MCMC chains used to explore the posterior."), self.walkers
-        )
         advanced_form.addRow(
             LabelWithInfo("Iterations", "Samples generated per walker for the full fit."), self.iterations
         )
@@ -1362,55 +1686,360 @@ class FittingPage(QWidget):
         form_layout.addWidget(self.advanced)
         form_layout.addStretch()
         buttons = QHBoxLayout()
-        preview = ActionButton(
+        self.preview = ActionButton(
             "Preview Fit",
             "fa6s.chart-line",
+            primary=True,
             tooltip="Run a quick deterministic fit to validate data, timing, and priors.",
         )
-        preview.clicked.connect(lambda: self.previewRequested.emit(self.values()))
-        full = ActionButton(
+        self.preview.clicked.connect(lambda: self.previewRequested.emit(self.values()))
+        self.full = ActionButton(
             "Run Full Fit",
             "fa6s.play",
-            primary=True,
             tooltip="Run the full MCMC uncertainty analysis in the background.",
         )
-        full.clicked.connect(lambda: self.fullFitRequested.emit(self.values()))
-        buttons.addWidget(preview)
-        buttons.addWidget(full)
+        self.full.clicked.connect(lambda: self.fullFitRequested.emit(self.values()))
+        self.full.setEnabled(False)
+        self.cancel = ActionButton(
+            "Cancel",
+            "fa6s.stop",
+            tooltip="Stop after the current safe checkpoint. Completed outputs remain intact.",
+        )
+        self.cancel.setEnabled(False)
+        self.cancel.clicked.connect(self.cancelRequested)
+        buttons.addWidget(self.cancel)
+        buttons.addWidget(self.preview)
+        buttons.addWidget(self.full)
         form_layout.addLayout(buttons)
         layout.addWidget(form_card, 2)
         result = QFrame()
         result.setObjectName("card")
+        self.result_card = result
         result_layout = QVBoxLayout(result)
         result_layout.setContentsMargins(18, 16, 18, 18)
         result_title = QLabel("Fit preview")
         result_title.setObjectName("sectionTitle")
         result_layout.addWidget(result_title)
-        message = QLabel(
+        self.message = QLabel(
             "Run Preview Fit to inspect the model and residuals before committing time to the full fit."
         )
-        message.setWordWrap(True)
-        message.setObjectName("muted")
-        result_layout.addWidget(message)
+        self.message.setWordWrap(True)
+        self.message.setObjectName("muted")
+        result_layout.addWidget(self.message)
+        self.fit_progress = QProgressBar()
+        self.fit_progress.setRange(0, 100)
+        self.fit_progress.setValue(0)
+        self.fit_progress.setTextVisible(True)
+        self.fit_progress.setVisible(False)
+        result_layout.addWidget(self.fit_progress)
+        self.progress_details = QLabel()
+        self.progress_details.setObjectName("muted")
+        self.progress_details.setWordWrap(True)
+        self.progress_details.setVisible(False)
+        result_layout.addWidget(self.progress_details)
+        self.preview_image = QLabel()
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setMinimumSize(420, 320)
+        self.preview_image.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_image.setVisible(False)
+        result_layout.addWidget(self.preview_image, 1)
+        preview_actions = QHBoxLayout()
+        preview_actions.addStretch()
+        self.view_in_files = ActionButton(
+            "View in Files",
+            "fa6s.folder-open",
+            tooltip="Reveal this fit-preview image in Finder or File Explorer.",
+        )
+        self.view_in_files.setMinimumWidth(160)
+        self.view_in_files.setEnabled(False)
+        self.view_in_files.clicked.connect(self._request_view_in_files)
+        preview_actions.addWidget(self.view_in_files)
+        result_layout.addLayout(preview_actions)
         result_layout.addStretch()
         layout.addWidget(result, 3)
         outer.addWidget(_scroll_page(body), 1)
 
+        for control in (
+            self.planet,
+            self.period,
+            self.mid_time,
+            self.depth,
+            self.filter,
+            self.light_curve,
+            self.detrending,
+            self.iterations,
+            self.burn,
+        ):
+            if isinstance(control, QComboBox):
+                control.currentTextChanged.connect(self.invalidate_preview)
+            else:
+                control.valueChanged.connect(self.invalidate_preview)
+        self.planet.activated.connect(self._planet_activated)
+        self.reset_setup("Loading the selected target and science-frame metadata…")
+
     def values(self) -> dict[str, Any]:
+        planet_name = self.planet.currentText().strip()
+        parameters = next(
+            (
+                value
+                for name, value in self._parameters.items()
+                if name.casefold() == planet_name.casefold()
+            ),
+            None,
+        )
         return {
-            "planet": self.planet.text().strip(),
+            "planet": planet_name,
+            "catalog_parameters": parameters,
             "period": self.period.value(),
             "mid_time": self.mid_time.value(),
             "depth": self.depth.value(),
-            "walkers": self.walkers.value(),
+            "filter": self.filter.currentData()
+            or normalize_filter(self.filter.currentText()),
+            "light_curve": self.light_curve.currentData(),
+            "detrending": self.detrending.currentData(),
             "iterations": self.iterations.value(),
             "burn": self.burn.value(),
         }
+
+    def set_fitting_options(self, light_curve: str, detrending: str) -> None:
+        for control, value in (
+            (self.light_curve, light_curve),
+            (self.detrending, detrending),
+        ):
+            index = control.findData(value)
+            if index >= 0:
+                blocked = control.blockSignals(True)
+                control.setCurrentIndex(index)
+                control.blockSignals(blocked)
+
+    def set_loading(self, message: str) -> None:
+        self.catalog_source.setText(message)
+        self.preview.setEnabled(False)
+        self.full.setEnabled(False)
+
+    def reset_setup(self, message: str) -> None:
+        self._parameters = {}
+        self._preview_valid = False
+        self._preview_pixmap = QPixmap()
+        self._rendered_preview_pixmap = QPixmap()
+        self._preview_path = None
+        self.planet.blockSignals(True)
+        self.planet.clear()
+        self.planet.blockSignals(False)
+        self.filter.blockSignals(True)
+        self.filter.setCurrentIndex(-1)
+        self.filter.blockSignals(False)
+        self.observation_source.setText("Science-frame metadata has not been loaded.")
+        self.preview_image.clear()
+        self.preview_image.setVisible(False)
+        self.view_in_files.setEnabled(False)
+        self.message.setText(
+            "Run Preview Fit to inspect the model and residuals before committing time to the full fit."
+        )
+        self.set_loading(message)
+
+    def set_planet_candidates(
+        self, candidates: list[PlanetParameters], selected_name: str = ""
+    ) -> None:
+        self._parameters = {parameters.name: parameters for parameters in candidates}
+        self.planet.blockSignals(True)
+        self.planet.clear()
+        for parameters in candidates:
+            self.planet.addItem(parameters.name)
+        selected = next(
+            (
+                index
+                for index, parameters in enumerate(candidates)
+                if selected_name
+                and parameters.name.casefold() == selected_name.casefold()
+            ),
+            0,
+        )
+        self.planet.setCurrentIndex(selected if candidates else -1)
+        self.planet.blockSignals(False)
+        if candidates:
+            self._apply_parameters(candidates[selected])
+        else:
+            self.catalog_source.setText(
+                "No catalog match was found for the saved target coordinates. Check Data & Target, then retry."
+            )
+        self._refresh_actions()
+
+    def _planet_activated(self, index: int) -> None:
+        if index >= 0:
+            parameters = self._parameters.get(self.planet.itemText(index))
+            if parameters:
+                self._apply_parameters(parameters)
+
+    def _apply_parameters(self, parameters: PlanetParameters) -> None:
+        for control in (self.period, self.mid_time, self.depth):
+            control.blockSignals(True)
+        self.period.setValue(parameters.period)
+        self.mid_time.setValue(parameters.mid_time)
+        self.depth.setValue(parameters.rp_over_rs**2)
+        for control in (self.period, self.mid_time, self.depth):
+            control.blockSignals(False)
+        dated = f" · snapshot {parameters.source_date}" if parameters.source_date else ""
+        self.catalog_source.setText(f"{parameters.source}{dated} · matched to project coordinates")
+        self.invalidate_preview()
+
+    def set_observation_metadata(
+        self,
+        filter_name: str | None,
+        exposure_time: float | None,
+        *,
+        filter_status: str = "detected",
+    ) -> None:
+        canonical = normalize_filter(filter_name) if filter_name else None
+        self.filter.blockSignals(True)
+        index = self.filter.findData(canonical) if canonical else -1
+        self.filter.setCurrentIndex(index)
+        if canonical and index < 0:
+            self.filter.setEditText(canonical)
+        self.filter.blockSignals(False)
+        exposure = f"{exposure_time:g} s exposures" if exposure_time else "exposure time unavailable"
+        if canonical:
+            self.observation_source.setText(
+                f"{passband_label(canonical)} ({canonical}) · {exposure} · detected from science FITS"
+            )
+        elif filter_status == "mixed":
+            self.observation_source.setText(
+                f"Science FITS contain multiple filters · {exposure}. Choose the passband for this light curve."
+            )
+        else:
+            self.observation_source.setText(
+                f"No recognized FITS filter was found · {exposure}. Choose the passband used for the observation."
+            )
+        self.invalidate_preview()
+
+    def set_busy(self, busy: bool, *, full: bool = False) -> None:
+        self._busy = busy
+        self.preview.set_running(busy and not full, "Running Preview…")
+        self.full.set_running(busy and full, "Running Full Fit…")
+        self.cancel.set_cancel_active(busy)
+        self.cancel.setEnabled(busy)
+        self.cancel.setText("Cancel")
+        if busy:
+            self.message.setText("Running full uncertainty fit…" if full else "Building fit preview…")
+            self.fit_progress.setRange(0, 0)
+            self.fit_progress.setVisible(True)
+            self.progress_details.clear()
+            self.progress_details.setVisible(True)
+        else:
+            self.fit_progress.setVisible(False)
+            self.progress_details.setVisible(False)
+        self._refresh_actions()
+
+    def set_stopping(self) -> None:
+        self.cancel.setText("Stopping…")
+        self.cancel.setEnabled(False)
+        self.message.setText("Stopping safely and discarding the incomplete fitting attempt…")
+
+    def update_event(self, event: StageEvent) -> None:
+        self.fit_progress.setVisible(True)
+        self.progress_details.setVisible(True)
+        details = event.details
+        phase = details.get("phase", event.checkpoint or "")
+        walkers = details.get("walkers")
+        elapsed = _format_duration(details.get("elapsed_seconds"))
+        eta = _format_duration(details.get("eta_seconds"))
+        if phase == "sampling" and event.total > 0:
+            self.fit_progress.setRange(0, event.total)
+            self.fit_progress.setValue(min(event.current, event.total))
+            self.fit_progress.setFormat(f"{event.current:,} of {event.total:,} MCMC steps")
+            self.message.setText("Sampling the posterior distribution…")
+        elif phase == "writing_results":
+            self.fit_progress.setRange(0, 1)
+            self.fit_progress.setValue(min(event.current, 1))
+            self.fit_progress.setFormat("Writing results…")
+            self.message.setText("Writing the completed fit without replacing the last result early…")
+        else:
+            self.fit_progress.setRange(0, 0)
+            self.message.setText(f"{event.message}…")
+        parts = []
+        if walkers:
+            parts.append(f"{int(walkers)} automatic HOPS walkers")
+        if elapsed:
+            parts.append(f"elapsed {elapsed}")
+        if eta:
+            parts.append(f"about {eta} remaining")
+        self.progress_details.setText(" · ".join(parts))
+
+    def show_cancelled(self, message: str) -> None:
+        self.message.setText(message)
+        self._refresh_actions()
+
+    def invalidate_preview(self, *_args: Any) -> None:
+        self._preview_valid = False
+        self._refresh_actions()
+
+    def show_preview(
+        self, path: Path, *, planet: str, passband: str, residual_std: float | None
+    ) -> None:
+        self._preview_path = Path(path)
+        self._preview_pixmap = QPixmap(str(self._preview_path))
+        available = self._preview_path.is_file() and not self._preview_pixmap.isNull()
+        self.preview_image.setVisible(available)
+        if available:
+            self._render_preview()
+        else:
+            self.preview_image.clear()
+        self.view_in_files.setEnabled(available)
+        residual = f" · residual scatter {residual_std:.5f}" if residual_std is not None else ""
+        self.message.setText(
+            f"Preview ready for {planet} using {passband}{residual}. Review the curve and residuals, then run the full fit."
+        )
+        self._preview_valid = available
+        self._refresh_actions()
+
+    def show_failure(self, message: str) -> None:
+        self.message.setText(message)
+        self._preview_valid = False
+        self._refresh_actions()
+
+    def _refresh_actions(self) -> None:
+        ready = bool(self._parameters) and bool(
+            self.filter.currentData() or normalize_filter(self.filter.currentText())
+        )
+        self.preview.set_primary(not self._preview_valid)
+        self.full.set_primary(self._preview_valid)
+        self.preview.setEnabled(ready and not self._busy)
+        self.full.setEnabled(ready and self._preview_valid and not self._busy)
+
+    def _render_preview(self) -> None:
+        if self._preview_pixmap.isNull():
+            return
+        logical_size = self.preview_image.size()
+        pixel_ratio = self._preview_device_pixel_ratio()
+        physical_size = QSize(
+            max(1, round(logical_size.width() * pixel_ratio)),
+            max(1, round(logical_size.height() * pixel_ratio)),
+        )
+        rendered = self._preview_pixmap.scaled(
+            physical_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        rendered.setDevicePixelRatio(pixel_ratio)
+        self._rendered_preview_pixmap = rendered
+        self.preview_image.setPixmap(rendered)
+
+    def _preview_device_pixel_ratio(self) -> float:
+        return max(1.0, float(self.devicePixelRatioF()))
+
+    def _request_view_in_files(self) -> None:
+        if self._preview_path and self._preview_path.is_file():
+            self.viewInFilesRequested.emit(self._preview_path)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._render_preview()
 
 
 class ComparisonStarsPage(QWidget):
     rankRequested = Signal()
     runRequested = Signal(list, float)
+    cancelRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1469,14 +2098,22 @@ class ComparisonStarsPage(QWidget):
         self.radius.setSuffix(" px")
         controls.addWidget(self.radius)
         controls.addStretch()
-        run = ActionButton(
+        self.cancel = ActionButton(
+            "Cancel",
+            "fa6s.stop",
+            tooltip="Stop after the current safe checkpoint. Completed outputs remain intact.",
+        )
+        self.cancel.setEnabled(False)
+        self.cancel.clicked.connect(self.cancelRequested)
+        controls.addWidget(self.cancel)
+        self.run = ActionButton(
             "Run photometry",
             "fa6s.play",
             primary=True,
             tooltip="Measure the target and approved comparisons across every accepted aligned frame in the background.",
         )
-        run.clicked.connect(self._run)
-        controls.addWidget(run)
+        self.run.clicked.connect(self._run)
+        controls.addWidget(self.run)
         card_layout.addLayout(controls)
         layout.addWidget(card, 1)
         self.status = QLabel("Plate solve or manually place the target, then rank candidates.")
@@ -1512,6 +2149,12 @@ class ComparisonStarsPage(QWidget):
             if self.table.item(row, 0).checkState() == Qt.CheckState.Checked:
                 selected.append((candidate["x"], candidate["y"]))
         self.runRequested.emit(selected, self.radius.value())
+
+    def set_busy(self, busy: bool) -> None:
+        self.run.set_running(busy, "Running Photometry…")
+        self.cancel.set_cancel_active(busy)
+        self.run.setEnabled(not busy)
+        self.cancel.setEnabled(busy)
 
 
 class ReportsPage(QWidget):

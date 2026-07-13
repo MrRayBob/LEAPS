@@ -15,7 +15,7 @@ from astropy.time import Time as astrotime
 from ..analysis.optimisation import Fitting
 from ..analysis.statistics import residual_statistics
 
-from ..errors import *
+from ..errors import PyLCCancelled, PyLCInputError
 from ..models.exoplanet_lc import planet_orbit, planet_star_projected_distance, planet_phase, \
     transit, transit_integrated, \
     transit_duration, transit_depth, eclipse, eclipse_integrated, eclipse_mid_time, eclipse_duration, eclipse_depth, \
@@ -524,9 +524,20 @@ class Planet:
                         walkers_spread=0.01,
                         return_traces=True,
                         verbose=False,
+                        progress_callback=None,
+                        cancelled=None,
                         ):
 
+        def check_cancelled():
+            if cancelled and cancelled():
+                raise PyLCCancelled('Fitting was cancelled by the host application.')
+
+        check_cancelled()
+        if progress_callback:
+            progress_callback('preparing_observations', 0, 0, {})
+
         for observation in self.observations:
+            check_cancelled()
             observation.reset(self)
             if observation.dict['model_info']['observation_type'] == 'eclipse':
                 raise PyLCInputError('You need to add only transit observation to proceed.')
@@ -743,6 +754,8 @@ class Planet:
                               optimiser='curve_fit',
                               strech_prior=strech_prior,
                               walkers_spread=walkers_spread,
+                              progress_callback=progress_callback,
+                              cancelled=cancelled,
                               )
 
             fitting._prefit(verbose=verbose)
@@ -799,11 +812,14 @@ class Planet:
                           optimiser=optimiser,
                           strech_prior=strech_prior,
                           walkers_spread=walkers_spread,
+                          progress_callback=progress_callback,
+                          cancelled=cancelled,
                           )
 
         print('\nOptimising initial parameters...')
 
         fitting.run(verbose=verbose)
+        check_cancelled()
 
         fitting.results['settings'] = {
             'output_folder': output_folder,
@@ -902,19 +918,34 @@ class Planet:
 
         if output_folder:
 
+            check_cancelled()
+            if progress_callback:
+                progress_callback(
+                    'writing_results',
+                    0,
+                    1,
+                    {'walkers': fitting.walkers, 'dimensions': fitting.dimensions},
+                )
+
             if os.path.isdir(output_folder):
                 shutil.rmtree(output_folder)
             os.mkdir(output_folder)
 
             save_dict(results_copy, os.path.join(output_folder, 'global_results.pickle'))
+            check_cancelled()
 
             fitting.save_results(os.path.join(output_folder, 'global_results.txt'))
+            check_cancelled()
 
             fitting.plot_corner(os.path.join(output_folder, 'global_correlations.pdf'))
+            check_cancelled()
 
             fitting.plot_traces(os.path.join(output_folder, 'global_traces.pdf'))
+            check_cancelled()
 
             for observation in self.observations:
+
+                check_cancelled()
 
                 cols = [
                     ['# variable'],
@@ -997,6 +1028,15 @@ class Planet:
                 save_dict(observation_copy_dict, os.path.join(output_folder, '{0}_results.pickle'.format(observation.obs_id)))
 
                 plot_transit_fitting_models(observation.dict, os.path.join(output_folder, '{0}_lightcurve.pdf'.format(observation.obs_id)))
+
+            check_cancelled()
+            if progress_callback:
+                progress_callback(
+                    'writing_results',
+                    1,
+                    1,
+                    {'walkers': fitting.walkers, 'dimensions': fitting.dimensions},
+                )
 
         results_copy['observations'] = {}
         for observation in self.observations:

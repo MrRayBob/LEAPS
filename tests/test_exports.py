@@ -15,7 +15,7 @@ def test_exoclock_and_etd_exports_are_created_from_last_success(tmp_path: Path) 
     project.manifest.target_name = "WTS-2 b"
     project.manifest.target_ra = "19:34:55.87"
     project.manifest.target_dec = "+36:48:55.79"
-    output = project.outputs_dir / StageID.PHOTOMETRY.value
+    output = project.outputs_dir / StageID.LIGHT_CURVE.value
     output.mkdir()
     curve = np.array([[2461000.1, 1.0, 0.002], [2461000.2, 0.97, 0.0025]])
     np.savetxt(output / "light_curve_aperture.txt", curve)

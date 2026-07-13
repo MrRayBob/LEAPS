@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import qtawesome as qta
 from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -162,6 +163,9 @@ class ActionButton(QPushButton):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(text, parent)
+        self._idle_text = text
+        self._idle_icon_name = icon_name
+        self._primary = primary
         if icon_name:
             self.setIcon(icon(icon_name, "white" if primary else COLORS["muted"]))
         if primary:
@@ -169,6 +173,40 @@ class ActionButton(QPushButton):
         if tooltip:
             self.setToolTip(tooltip)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_running(self, running: bool, text: str = "Running…") -> None:
+        self.setProperty("running", running)
+        self.setText(text if running else self._idle_text)
+        if running:
+            self.setIcon(QIcon())
+        elif self._idle_icon_name:
+            self.setIcon(
+                icon(
+                    self._idle_icon_name,
+                    "white" if self._primary else COLORS["muted"],
+                )
+            )
+        else:
+            self.setIcon(QIcon())
+        self._refresh_style()
+
+    def set_primary(self, primary: bool) -> None:
+        self._primary = primary
+        self.setProperty("primary", primary)
+        if self._idle_icon_name and not self.property("running"):
+            self.setIcon(icon(self._idle_icon_name, "white" if primary else COLORS["muted"]))
+        self._refresh_style()
+
+    def set_cancel_active(self, active: bool) -> None:
+        self.setProperty("cancelActive", active)
+        if self._idle_icon_name:
+            self.setIcon(icon(self._idle_icon_name, "white" if active else COLORS["muted"]))
+        self._refresh_style()
+
+    def _refresh_style(self) -> None:
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
 
 class StageNavButton(QFrame):
@@ -188,6 +226,10 @@ class StageNavButton(QFrame):
         self.status_icon = QLabel()
         self.status_icon.setFixedSize(36, 36)
         self.status_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._spinner_phase = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(80)
+        self._spinner_timer.timeout.connect(self._advance_spinner)
         layout.addWidget(self.status_icon)
         labels = QVBoxLayout()
         labels.setSpacing(1)
@@ -216,9 +258,50 @@ class StageNavButton(QFrame):
         }
         name, color = icons[state.status]
         icon_size = 30 if state.status == StageStatus.LOCKED else 23
-        self.status_icon.setPixmap(icon(name, color).pixmap(icon_size, icon_size))
+        if state.status == StageStatus.RUNNING:
+            self._spinner_phase = 0
+            self._render_spinner()
+            self._spinner_timer.start()
+        else:
+            self._spinner_timer.stop()
+            self._spinner_phase = 0
+            self.status_icon.setPixmap(icon(name, color).pixmap(icon_size, icon_size))
         self.setEnabled(state.status != StageStatus.LOCKED)
         self._restyle()
+
+    def _advance_spinner(self) -> None:
+        self._spinner_phase = (self._spinner_phase + 1) % 8
+        self._render_spinner()
+
+    def _render_spinner(self) -> None:
+        canvas = QPixmap(30, 30)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        center = 15.0
+        orbit_radius = 9.0
+        opacities = (255, 220, 185, 150, 115, 85, 60, 38)
+        radii = (2.6, 2.45, 2.3, 2.15, 2.0, 1.85, 1.7, 1.55)
+        for index in range(8):
+            trail = (self._spinner_phase - index) % 8
+            angle = -math.pi / 2 + index * math.tau / 8
+            x = center + math.cos(angle) * orbit_radius
+            y = center + math.sin(angle) * orbit_radius
+            color = QColor(COLORS["cyan"])
+            color.setAlpha(opacities[trail])
+            painter.setBrush(color)
+            dot_radius = radii[trail]
+            painter.drawEllipse(
+                QRectF(
+                    x - dot_radius,
+                    y - dot_radius,
+                    dot_radius * 2,
+                    dot_radius * 2,
+                )
+            )
+        painter.end()
+        self.status_icon.setPixmap(canvas)
 
     def set_active(self, active: bool) -> None:
         self.active = active
@@ -320,6 +403,8 @@ class FITSImageView(QGraphicsView):
         self.image_width = 0
         self.image_height = 0
         self.marker_items: dict[str, list[QGraphicsItem]] = {}
+        self._middle_pan_active = False
+        self._middle_pan_position = QPoint()
         self.set_mode("pan")
         if asset and asset.exists():
             self.load_pixmap(QPixmap(str(asset)))
@@ -383,12 +468,15 @@ class FITSImageView(QGraphicsView):
             if mode == "pan"
             else QGraphicsView.DragMode.NoDrag
         )
+        self.viewport().setCursor(self._cursor_for_mode())
+
+    def _cursor_for_mode(self) -> Qt.CursorShape:
         cursors = {
             "pan": Qt.CursorShape.OpenHandCursor,
             "zoom": Qt.CursorShape.SizeAllCursor,
             "select": Qt.CursorShape.CrossCursor,
         }
-        self.viewport().setCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor))
+        return cursors.get(self.mode, Qt.CursorShape.ArrowCursor)
 
     def begin_selection(self, role: str) -> None:
         self.selection_role = role
@@ -397,6 +485,12 @@ class FITSImageView(QGraphicsView):
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._middle_pan_active = True
+            self._middle_pan_position = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if self.mode == "select" and event.button() == Qt.MouseButton.LeftButton:
             scene = self.mapToScene(event.position().toPoint())
             if self.sceneRect().contains(scene):
@@ -413,6 +507,25 @@ class FITSImageView(QGraphicsView):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._middle_pan_active:
+            position = event.position().toPoint()
+            delta = position - self._middle_pan_position
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self._middle_pan_position = position
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton and self._middle_pan_active:
+            self._middle_pan_active = False
+            self.viewport().setCursor(self._cursor_for_mode())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
@@ -503,7 +616,11 @@ class FITSWorkspace(QFrame):
         tools.setSpacing(0)
         self.mode_buttons: dict[str, QPushButton] = {}
         for text, icon_name, tip in (
-            ("Pan", "fa6s.hand", "Drag the image to inspect a different area."),
+            (
+                "Pan",
+                "fa6s.hand",
+                "Drag the image to inspect a different area. Hold the middle mouse button to pan from any tool.",
+            ),
             ("Zoom", "fa6s.magnifying-glass", "Zoom into a region of the FITS image."),
             (
                 "Invert",

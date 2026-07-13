@@ -9,16 +9,25 @@ import pytest
 from astropy.io import fits
 
 from leaps.diagnostics import DiagnosticLogger
-from leaps.fits_inventory import FITSInventory, target_from_header, validate_coordinates
+from leaps.fits_inventory import (
+    FITSInventory,
+    summarize_observation_records,
+    target_from_header,
+    validate_coordinates,
+)
 from leaps.models import LEAPSError, StageID
 from leaps.project import ProjectWorkspace
 
 
-def _write_fits(path: Path, image_type: str, exposure: float = 30.0) -> None:
+def _write_fits(
+    path: Path, image_type: str, exposure: float = 30.0, filter_name: str = ""
+) -> None:
     header = fits.Header()
     header["IMAGETYP"] = image_type
     header["EXPTIME"] = exposure
     header["OBSERVER"] = "Private Name"
+    if filter_name:
+        header["FILTER"] = filter_name
     fits.writeto(path, np.arange(64, dtype=np.uint16).reshape(8, 8), header=header)
 
 
@@ -32,6 +41,41 @@ def test_inventory_reads_headers_only_and_groups_frames(tmp_path: Path) -> None:
     assert len(grouped["dark"]) == 1
     assert len(grouped["flat"]) == 1
     assert all(record.shape == (8, 8) for record in records)
+
+
+def test_inventory_normalizes_hops_filter_and_summarizes_science_metadata(tmp_path: Path) -> None:
+    _write_fits(tmp_path / "light_001.fits", "Light Frame", 30.0, "Cousins_R")
+    _write_fits(tmp_path / "light_002.fits", "Light Frame", 32.0, "Rc")
+    records = FITSInventory(tmp_path).discover()
+    metadata = summarize_observation_records(records)
+
+    assert {record.filter_name for record in records} == {"COUSINS_R"}
+    assert metadata["filter"] == "COUSINS_R"
+    assert metadata["filter_status"] == "detected"
+    assert metadata["exposure_time"] == 31.0
+
+
+def test_observation_metadata_requires_user_choice_for_mixed_filters(tmp_path: Path) -> None:
+    _write_fits(tmp_path / "light_r.fits", "Light Frame", 30.0, "Cousins_R")
+    _write_fits(tmp_path / "light_v.fits", "Light Frame", 30.0, "V")
+
+    metadata = summarize_observation_records(FITSInventory(tmp_path).discover())
+
+    assert metadata["filter"] is None
+    assert metadata["filter_status"] == "mixed"
+    assert metadata["filters_detected"] == ["COUSINS_R", "JOHNSON_V"]
+
+
+def test_inventory_excludes_project_workspaces_and_interrupted_reset_data(tmp_path: Path) -> None:
+    _write_fits(tmp_path / "light_001.fits", "Light Frame")
+    for folder in ("LEAPS", ".leaps", ".LEAPS-reset-partial"):
+        generated = tmp_path / folder / "outputs" / "reduction"
+        generated.mkdir(parents=True)
+        _write_fits(generated / "generated.fits", "Light Frame")
+
+    records = FITSInventory(tmp_path).discover()
+
+    assert [record.path for record in records] == ["light_001.fits"]
 
 
 def test_coordinates_are_validated_without_requiring_a_name() -> None:

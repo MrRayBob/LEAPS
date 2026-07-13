@@ -93,7 +93,22 @@ QPushButton:pressed {{ background: #0a1b29; }}
 QPushButton:disabled {{ color: {COLORS["muted_2"]}; background: #0a1824; border-color: #183044; }}
 QPushButton[primary="true"] {{ background: #138ec6; border-color: #1eb8ef; color: white; }}
 QPushButton[primary="true"]:hover {{ background: #169fdc; }}
+QPushButton[primary="true"]:disabled {{
+    color: {COLORS["muted_2"]};
+    background: #0a1824;
+    border-color: #183044;
+}}
 QPushButton[danger="true"] {{ color: #ff8c7c; border-color: #7e3e39; }}
+QPushButton[running="true"], QPushButton[running="true"]:disabled {{
+    background: #197c5f;
+    border-color: {COLORS["green"]};
+    color: white;
+}}
+QPushButton[cancelActive="true"], QPushButton[cancelActive="true"]:hover {{
+    background: #b93632;
+    border-color: {COLORS["red"]};
+    color: white;
+}}
 QToolButton {{
     background: transparent;
     border: 0;

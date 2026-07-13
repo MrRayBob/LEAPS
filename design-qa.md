@@ -49,4 +49,14 @@
 - Reference versus implementation visual review: passed
 - Locked-sidebar source versus implementation review: passed; no P0, P1, or P2 visual issues found
 
+## Fit preview file reveal
+
+- Source visual: `/var/folders/wg/4c5ys1f50kg_hwllv6bpb4fc0000gn/T/TemporaryItems/NSIRD_screencaptureui_gM0bHN/Screenshot 2026-07-13 at 13.52.25.png`
+- Implementation capture: `/private/tmp/leaps-fit-preview-view-in-files-2.png`
+- Side-by-side comparison: `/private/tmp/leaps-fit-preview-comparison-2.png`
+- The `View in Files` action sits directly beneath the preview and follows LEAPS button, spacing, icon, and color conventions.
+- Generated fit previews are 2400×1680, and in-app rendering uses device-pixel-ratio-aware smooth scaling.
+- The button remains disabled until a valid preview exists and reveals the exact image in Finder or Explorer.
+- Focused fitting and UI tests, Ruff, compilation, and diff checks passed.
+
 final result: passed

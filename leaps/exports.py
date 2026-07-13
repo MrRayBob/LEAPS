@@ -15,14 +15,14 @@ class TransitExporter:
         self.project = project
 
     def _curve(self) -> np.ndarray:
-        path = self.project.outputs_dir / StageID.PHOTOMETRY.value / "light_curve_aperture.txt"
+        path = self.project.outputs_dir / StageID.LIGHT_CURVE.value / "light_curve_aperture.txt"
         if not path.exists():
             raise LEAPSError(
                 "LIGHT_CURVE_REQUIRED",
                 "No successful light curve is available",
-                "Run Photometry before creating a submission export.",
-                ["Open Apertures", "Run photometry"],
-                stage=StageID.PHOTOMETRY,
+                "Review and approve the comparison-star ensemble before creating an export.",
+                ["Open Light Curve", "Confirm the comparison stars"],
+                stage=StageID.LIGHT_CURVE,
             )
         curve = np.atleast_2d(np.loadtxt(path))
         if curve.shape[1] < 3:
