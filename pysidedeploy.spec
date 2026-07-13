@@ -19,4 +19,4 @@ plugins = platforms,imageformats,styles
 [nuitka]
 macos.permissions =
 mode = standalone
-extra_args = --quiet --noinclude-qt-translations --include-data-dir=leaps/assets=leaps/assets --include-package=hops.pylightcurve41 --include-package=hops.thirdparty --include-package-data=hops --include-package-data=exoclock --include-package-data=exotethys
+extra_args = --quiet --assume-yes-for-downloads --noinclude-qt-translations --include-data-dir=leaps/assets=leaps/assets --include-package=hops.pylightcurve41 --include-package=hops.thirdparty --include-package-data=hops --include-package-data=exoclock --include-package-data=exotethys
