@@ -29,6 +29,7 @@ class StageID(StrEnum):
     PHOTOMETRY = "photometry"
     LIGHT_CURVE = "light_curve"
     FITTING = "fitting"
+    SECONDARY_ECLIPSE = "secondary_eclipse"
 
 
 class StageStatus(StrEnum):
@@ -133,8 +134,13 @@ class ProjectManifest:
     def __post_init__(self) -> None:
         for index, stage in enumerate(StageID):
             if stage.value not in self.stages:
-                status = StageStatus.READY if index == 0 else StageStatus.LOCKED
-                summary = "Ready" if index == 0 else "Locked"
+                is_completed_fit = (
+                    stage == StageID.SECONDARY_ECLIPSE
+                    and self.stages.get(StageID.FITTING.value, StageState()).status
+                    == StageStatus.COMPLETE
+                )
+                status = StageStatus.READY if index == 0 or is_completed_fit else StageStatus.LOCKED
+                summary = "Ready" if index == 0 or is_completed_fit else "Locked"
                 self.stages[stage.value] = StageState(status=status, summary=summary)
 
     def to_dict(self) -> dict[str, Any]:

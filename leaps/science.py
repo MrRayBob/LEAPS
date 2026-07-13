@@ -1852,6 +1852,9 @@ class FittingService:
             check_cancelled()
             residual_std = observation.get("detrended_statistics", {}).get("res_std")
             actual_walkers = result.get("settings", {}).get("walkers")
+            fitted_mid_time = _optional_finite_float(
+                observation.get("parameters", {}).get("mid_time", {}).get("value")
+            )
             summary = {
                 "planet": parameters.name,
                 "source": parameters.source,
@@ -1867,6 +1870,11 @@ class FittingService:
                 "residual_std": residual_std,
                 "complete": bool(result),
                 "parameters": asdict(parameters),
+                "fitted_ephemeris": {
+                    "period": parameters.period,
+                    "mid_time": fitted_mid_time or parameters.mid_time,
+                    "time_standard": "BJD_TDB",
+                },
             }
             if full and pending is not None and target is not None:
                 (pending / "fit-summary.json").write_text(
@@ -1920,6 +1928,828 @@ class FittingService:
                 stage=StageID.FITTING,
                 technical_details=str(exc),
             ) from exc
+
+
+class SecondaryEclipseService:
+    """Fit a conservative, fixed-phase secondary-eclipse model to an approved light curve.
+
+    This deliberately does not scan arbitrary phases for the deepest dip.  It evaluates the
+    user-visible ephemeris and nearby control phases instead, so a result is easier to interpret
+    and less likely to turn ordinary systematics into a discovery claim.
+    """
+
+    LIGHT_CURVE_FILES = {
+        "aperture": "light_curve_aperture.txt",
+        "gaussian": "light_curve_gauss.txt",
+    }
+
+    @dataclass(slots=True)
+    class Result:
+        planet: str
+        outcome: str
+        outcome_label: str
+        message: str
+        preview_path: Path
+        output_path: Path
+        depth_ppm: float | None
+        depth_uncertainty_ppm: float | None
+        significance: float | None
+        red_noise_beta: float | None
+        residual_rms_ppm: float | None
+        expected_phase: float
+        duration_hours: float
+        event_count: int
+        local_points: int
+        in_eclipse_points: int
+        control_significance: float | None
+        time_standard: str
+        raw: dict[str, Any] = field(repr=False)
+
+    @staticmethod
+    def estimate_duration_hours(parameters: PlanetParameters) -> float:
+        """Return a defensible first duration estimate from the catalogued transit geometry."""
+        try:
+            period = float(parameters.period)
+            scaled_axis = float(parameters.sma_over_rs)
+            radius_ratio = float(parameters.rp_over_rs)
+            inclination = math.radians(float(parameters.inclination))
+            if period <= 0 or scaled_axis <= 0:
+                raise ValueError("period and scaled semi-major axis must be positive")
+            impact_parameter = abs(scaled_axis * math.cos(inclination))
+            chord_squared = (1.0 + radius_ratio) ** 2 - impact_parameter**2
+            denominator = scaled_axis * max(math.sin(inclination), 1e-6)
+            if chord_squared <= 0 or denominator <= 0:
+                raise ValueError("catalogued geometry is not transiting")
+            argument = min(1.0, max(0.0, math.sqrt(chord_squared) / denominator))
+            duration_hours = period * 24.0 * math.asin(argument) / math.pi
+            if not math.isfinite(duration_hours):
+                raise ValueError("duration is not finite")
+            return min(max(duration_hours, 0.25), min(12.0, period * 12.0))
+        except (TypeError, ValueError, OverflowError):
+            return 2.0
+
+    def run(
+        self,
+        project: ProjectWorkspace,
+        parameters: PlanetParameters,
+        *,
+        expected_phase: float = 0.5,
+        duration_hours: float | None = None,
+        light_curve: str = "aperture",
+        baseline: str = "linear",
+        latitude: float | None = None,
+        longitude: float | None = None,
+        emit: Emitter | None = None,
+        token: CancellationToken | None = None,
+    ) -> Result:
+        token = token or CancellationToken()
+        if duration_hours is None:
+            duration_hours = self.estimate_duration_hours(parameters)
+        self._validate_inputs(parameters, expected_phase, duration_hours, light_curve, baseline)
+
+        def check_cancelled() -> None:
+            if token.cancelled:
+                raise LEAPSError(
+                    "JOB_CANCELLED",
+                    "Secondary-eclipse analysis cancelled",
+                    "The incomplete analysis was discarded. Previous eclipse results were preserved.",
+                    ["Run the analysis again when ready"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+
+        _emit(
+            emit,
+            StageID.SECONDARY_ECLIPSE,
+            JobStatus.RUNNING,
+            "Loading approved light curve",
+            0,
+            4,
+            checkpoint="loading_curve",
+        )
+        check_cancelled()
+        time_utc, flux, uncertainty = self._load_curve(project, light_curve)
+        times_bjd, time_standard = self._to_bjd_tdb(
+            time_utc,
+            parameters,
+            latitude=latitude,
+            longitude=longitude,
+        )
+        check_cancelled()
+        _emit(
+            emit,
+            StageID.SECONDARY_ECLIPSE,
+            JobStatus.RUNNING,
+            "Converting observation times",
+            1,
+            4,
+            checkpoint="converting_times",
+        )
+
+        period = float(parameters.period)
+        duration_phase = float(duration_hours) / (period * 24.0)
+        window_phase = min(0.24, max(0.035, duration_phase * 3.0))
+        phase = self._relative_phase(times_bjd, float(parameters.mid_time), period, expected_phase)
+        fit = self._fit_window(
+            phase,
+            times_bjd,
+            flux,
+            uncertainty,
+            duration_phase=duration_phase,
+            window_phase=window_phase,
+            baseline=baseline,
+        )
+        check_cancelled()
+        _emit(
+            emit,
+            StageID.SECONDARY_ECLIPSE,
+            JobStatus.RUNNING,
+            "Fitting fixed-phase eclipse model",
+            2,
+            4,
+            checkpoint="fitting_eclipse",
+        )
+
+        controls = self._control_fits(
+            times_bjd,
+            flux,
+            uncertainty,
+            parameters,
+            expected_phase,
+            duration_phase,
+            window_phase,
+            baseline,
+        )
+        outcome, label, message = self._classify(fit, controls)
+        event_count = self._observed_event_count(
+            times_bjd,
+            phase,
+            float(parameters.mid_time),
+            period,
+            expected_phase,
+            fit["local_mask"],
+        )
+        if outcome == "candidate" and event_count < 2:
+            message += " Only one eclipse window is represented, so independent data are essential."
+        if time_standard != "BJD_TDB":
+            message += " Set observatory coordinates for a barycentric timing correction."
+        check_cancelled()
+
+        depth = fit.get("depth")
+        depth_uncertainty = fit.get("depth_uncertainty")
+        significance = fit.get("significance")
+        beta = fit.get("red_noise_beta")
+        residual_rms = fit.get("residual_rms")
+        control_significance = self._strongest_control_significance(controls)
+        summary = {
+            "analysis": "fixed-phase secondary eclipse / occultation",
+            "planet": parameters.name,
+            "parameters": asdict(parameters),
+            "light_curve": light_curve,
+            "baseline": baseline,
+            "expected_phase": expected_phase,
+            "duration_hours": duration_hours,
+            "duration_phase": duration_phase,
+            "window_phase": window_phase,
+            "time_standard": time_standard,
+            "outcome": outcome,
+            "outcome_label": label,
+            "message": message,
+            "depth_ppm": self._as_ppm(depth),
+            "depth_uncertainty_ppm": self._as_ppm(depth_uncertainty),
+            "significance": significance,
+            "red_noise_beta": beta,
+            "residual_rms_ppm": self._as_ppm(residual_rms),
+            "event_count": event_count,
+            "local_points": int(fit["local_mask"].sum()),
+            "in_eclipse_points": int(fit["in_eclipse_mask"].sum()),
+            "control_significance": control_significance,
+            "coverage": fit["coverage"],
+            "controls": controls,
+            "model": {
+                "depth": depth,
+                "depth_uncertainty": depth_uncertainty,
+                "delta_chi_squared": fit.get("delta_chi_squared"),
+                "points_used": fit.get("points_used"),
+            },
+            "interpretation": (
+                "A secondary eclipse measures the planet-to-star flux ratio in this passband. "
+                "It is not, by itself, a measurement of geometric albedo or a confirmation of a planet."
+            ),
+        }
+        pending: Path | None = None
+        try:
+            _emit(
+                emit,
+                StageID.SECONDARY_ECLIPSE,
+                JobStatus.RUNNING,
+                "Writing eclipse diagnostics",
+                3,
+                4,
+                checkpoint="writing_results",
+            )
+            pending, target = project.begin_transaction(StageID.SECONDARY_ECLIPSE)
+            self._write_outputs(
+                pending,
+                phase,
+                times_bjd,
+                flux,
+                uncertainty,
+                fit,
+                summary,
+                duration_phase=duration_phase,
+                window_phase=window_phase,
+            )
+            check_cancelled()
+            project.commit_transaction(pending, target)
+            _emit(
+                emit,
+                StageID.SECONDARY_ECLIPSE,
+                JobStatus.SUCCEEDED,
+                "Secondary-eclipse analysis complete",
+                4,
+                4,
+                checkpoint="complete",
+            )
+        except BaseException:
+            project.discard_pending_transaction(StageID.SECONDARY_ECLIPSE)
+            raise
+
+        return self.Result(
+            planet=parameters.name,
+            outcome=outcome,
+            outcome_label=label,
+            message=message,
+            preview_path=target / "secondary-eclipse.png",
+            output_path=target,
+            depth_ppm=self._as_ppm(depth),
+            depth_uncertainty_ppm=self._as_ppm(depth_uncertainty),
+            significance=significance,
+            red_noise_beta=beta,
+            residual_rms_ppm=self._as_ppm(residual_rms),
+            expected_phase=expected_phase,
+            duration_hours=duration_hours,
+            event_count=event_count,
+            local_points=int(fit["local_mask"].sum()),
+            in_eclipse_points=int(fit["in_eclipse_mask"].sum()),
+            control_significance=control_significance,
+            time_standard=time_standard,
+            raw=summary,
+        )
+
+    @classmethod
+    def _validate_inputs(
+        cls,
+        parameters: PlanetParameters,
+        expected_phase: float,
+        duration_hours: float,
+        light_curve: str,
+        baseline: str,
+    ) -> None:
+        if light_curve not in cls.LIGHT_CURVE_FILES:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_LIGHT_CURVE_UNKNOWN",
+                "Choose a valid light curve",
+                "The selected approved light curve is not available for secondary-eclipse analysis.",
+                ["Choose Aperture photometry", "Choose Gaussian photometry"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        if baseline not in {"constant", "linear", "quadratic"}:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_BASELINE_UNKNOWN",
+                "Choose a valid baseline",
+                "Use a constant, linear, or quadratic baseline for the local eclipse fit.",
+                ["Choose a listed baseline"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        if not math.isfinite(float(parameters.period)) or float(parameters.period) <= 0:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_PERIOD_INVALID",
+                "The fitted period needs attention",
+                "A positive, finite orbital period is required to phase the secondary eclipse.",
+                ["Run the full transit fit again", "Check the fitted ephemeris"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        if not 0.05 <= float(expected_phase) <= 0.95:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_PHASE_INVALID",
+                "The expected eclipse phase needs attention",
+                "Choose a phase between 0.05 and 0.95 so this analysis cannot overlap the primary transit.",
+                ["Use phase 0.50 for a circular orbit", "Check an eccentric-orbit ephemeris"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        if not math.isfinite(float(duration_hours)) or not 0.05 <= float(duration_hours) <= 24.0:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_DURATION_INVALID",
+                "The eclipse duration needs attention",
+                "Choose an expected duration between 3 minutes and 24 hours.",
+                ["Use the suggested duration", "Check the transit geometry"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+
+    def _load_curve(
+        self, project: ProjectWorkspace, light_curve: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        path = project.outputs_dir / StageID.LIGHT_CURVE.value / self.LIGHT_CURVE_FILES[light_curve]
+        try:
+            data = np.loadtxt(path, unpack=True)
+            if data.ndim != 2 or data.shape[0] < 3:
+                raise ValueError("the file does not contain three columns")
+            time_utc, flux, uncertainty = (np.asarray(column, dtype=float) for column in data[:3])
+            valid = np.isfinite(time_utc) & np.isfinite(flux) & np.isfinite(uncertainty) & (uncertainty > 0)
+            time_utc, flux, uncertainty = time_utc[valid], flux[valid], uncertainty[valid]
+            if time_utc.size < 10:
+                raise ValueError("fewer than 10 finite measurements remain")
+            return time_utc, flux, uncertainty
+        except (OSError, ValueError) as exc:
+            raise LEAPSError(
+                "SECONDARY_ECLIPSE_LIGHT_CURVE_INVALID",
+                "The approved light curve cannot be analysed",
+                "LEAPS needs at least 10 finite time, flux, and uncertainty measurements.",
+                ["Review the Light Curve", "Run Photometry again", "Choose the other photometry method"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=f"{path}\n{exc}",
+            ) from exc
+
+    @staticmethod
+    def _to_bjd_tdb(
+        time_utc: np.ndarray,
+        parameters: PlanetParameters,
+        *,
+        latitude: float | None,
+        longitude: float | None,
+    ) -> tuple[np.ndarray, str]:
+        from astropy.time import Time
+
+        times = Time(time_utc, format="jd", scale="utc")
+        if latitude is None or longitude is None:
+            return np.asarray(times.tdb.jd, dtype=float), "TDB (observatory correction unavailable)"
+        try:
+            import astropy.units as units
+            from astropy.coordinates import EarthLocation, SkyCoord
+
+            location = EarthLocation.from_geodetic(
+                float(longitude) * units.deg,
+                float(latitude) * units.deg,
+            )
+            target = SkyCoord(parameters.ra, parameters.dec, unit=(units.hourangle, units.deg))
+            observed = Time(time_utc, format="jd", scale="utc", location=location)
+            barycentric = observed.light_travel_time(target, kind="barycentric")
+            return np.asarray((observed.tdb + barycentric).jd, dtype=float), "BJD_TDB"
+        except Exception:
+            return np.asarray(times.tdb.jd, dtype=float), "TDB (observatory correction unavailable)"
+
+    @staticmethod
+    def _relative_phase(
+        times: np.ndarray, mid_time: float, period: float, expected_phase: float
+    ) -> np.ndarray:
+        cycles = (np.asarray(times, dtype=float) - mid_time) / period - expected_phase
+        return np.mod(cycles + 0.5, 1.0) - 0.5
+
+    @staticmethod
+    def _eclipse_template(phase: np.ndarray, duration_phase: float) -> np.ndarray:
+        half_duration = max(duration_phase / 2.0, 1e-8)
+        ingress = max(half_duration * 0.18, 1e-8)
+        flat_half = max(0.0, half_duration - ingress)
+        absolute_phase = np.abs(np.asarray(phase, dtype=float))
+        template = np.zeros_like(absolute_phase)
+        template[absolute_phase <= flat_half] = 1.0
+        slope = (absolute_phase > flat_half) & (absolute_phase < half_duration)
+        template[slope] = (half_duration - absolute_phase[slope]) / ingress
+        return template
+
+    @classmethod
+    def _fit_window(
+        cls,
+        phase: np.ndarray,
+        times: np.ndarray,
+        flux: np.ndarray,
+        uncertainty: np.ndarray,
+        *,
+        duration_phase: float,
+        window_phase: float,
+        baseline: str,
+    ) -> dict[str, Any]:
+        local_mask = np.abs(phase) <= window_phase
+        in_eclipse_mask = local_mask & (np.abs(phase) <= duration_phase / 2.0)
+        before_mask = local_mask & (phase < -duration_phase / 2.0)
+        after_mask = local_mask & (phase > duration_phase / 2.0)
+        coverage = {
+            "available": bool(
+                local_mask.sum() >= 12
+                and in_eclipse_mask.sum() >= 3
+                and before_mask.sum() >= 3
+                and after_mask.sum() >= 3
+            ),
+            "local_points": int(local_mask.sum()),
+            "in_eclipse_points": int(in_eclipse_mask.sum()),
+            "before_points": int(before_mask.sum()),
+            "after_points": int(after_mask.sum()),
+        }
+        result: dict[str, Any] = {
+            "local_mask": local_mask,
+            "in_eclipse_mask": in_eclipse_mask,
+            "coverage": coverage,
+            "model": np.full(int(local_mask.sum()), np.nan),
+            "baseline_model": np.full(int(local_mask.sum()), np.nan),
+            "residuals": np.full(int(local_mask.sum()), np.nan),
+            "template": cls._eclipse_template(phase[local_mask], duration_phase),
+            "depth": None,
+            "depth_uncertainty": None,
+            "significance": None,
+            "red_noise_beta": None,
+            "residual_rms": None,
+            "delta_chi_squared": None,
+            "points_used": 0,
+        }
+        if not coverage["available"]:
+            return result
+
+        local_phase = phase[local_mask]
+        local_flux = flux[local_mask]
+        local_uncertainty = uncertainty[local_mask]
+        template = result["template"]
+        x = local_phase / max(window_phase, 1e-8)
+        design_baseline = [np.ones_like(x)]
+        if baseline in {"linear", "quadratic"}:
+            design_baseline.append(x)
+        if baseline == "quadratic":
+            design_baseline.append(x**2)
+        baseline_matrix = np.column_stack(design_baseline)
+        design = np.column_stack((baseline_matrix, -template))
+        if np.linalg.matrix_rank(design) < design.shape[1]:
+            coverage["available"] = False
+            coverage["reason"] = "The observed phase range cannot separate an eclipse from the baseline."
+            return result
+
+        keep = np.ones(local_flux.size, dtype=bool)
+        for _ in range(2):
+            _, _, _, residuals, _ = cls._weighted_fit(
+                design[keep], local_flux[keep], local_uncertainty[keep], design, local_flux
+            )
+            scatter = max(
+                cls._robust_scatter(residuals[keep]),
+                float(np.nanmedian(local_uncertainty[keep])),
+            )
+            updated_keep = np.abs(residuals) <= 5.0 * max(scatter, 1e-12)
+            if updated_keep.sum() < design.shape[1] + 3 or np.array_equal(updated_keep, keep):
+                break
+            keep = updated_keep
+
+        coefficients, covariance, model, residuals, chi_squared = cls._weighted_fit(
+            design[keep], local_flux[keep], local_uncertainty[keep], design, local_flux
+        )
+        _, _, _, _, no_eclipse_chi_squared = cls._weighted_fit(
+            baseline_matrix[keep],
+            local_flux[keep],
+            local_uncertainty[keep],
+            baseline_matrix,
+            local_flux,
+        )
+        formal_uncertainty = float(math.sqrt(max(float(covariance[-1, -1]), 0.0)))
+        beta = cls._red_noise_beta(residuals[keep], times[local_mask][keep])
+        depth_uncertainty = formal_uncertainty * beta
+        depth = float(coefficients[-1])
+        significance = depth / depth_uncertainty if depth_uncertainty > 0 else None
+        result.update(
+            {
+                "model": model,
+                "baseline_model": model + depth * template,
+                "residuals": residuals,
+                "depth": depth,
+                "depth_uncertainty": depth_uncertainty,
+                "significance": significance,
+                "red_noise_beta": beta,
+                "residual_rms": float(np.std(residuals[keep], ddof=1)) if keep.sum() > 1 else None,
+                "delta_chi_squared": max(0.0, no_eclipse_chi_squared - chi_squared),
+                "points_used": int(keep.sum()),
+                "kept_mask": keep,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _weighted_fit(
+        design_used: np.ndarray,
+        flux_used: np.ndarray,
+        uncertainty_used: np.ndarray,
+        design_all: np.ndarray,
+        flux_all: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        weights = 1.0 / np.square(uncertainty_used)
+        weighted_design = design_used * np.sqrt(weights)[:, None]
+        weighted_flux = flux_used * np.sqrt(weights)
+        coefficients, *_ = np.linalg.lstsq(weighted_design, weighted_flux, rcond=None)
+        model_used = design_used @ coefficients
+        residuals_used = flux_used - model_used
+        degrees_of_freedom = max(1, flux_used.size - design_used.shape[1])
+        chi_squared = float(np.sum(np.square(residuals_used / uncertainty_used)))
+        scale = max(1.0, chi_squared / degrees_of_freedom)
+        covariance = np.linalg.pinv(design_used.T @ (weights[:, None] * design_used)) * scale
+        model_all = design_all @ coefficients
+        return coefficients, covariance, model_all, np.asarray(flux_all) - model_all, chi_squared
+
+    @staticmethod
+    def _robust_scatter(values: np.ndarray) -> float:
+        finite = np.asarray(values, dtype=float)[np.isfinite(values)]
+        if finite.size < 2:
+            return 0.0
+        median = float(np.median(finite))
+        return float(1.4826 * np.median(np.abs(finite - median)))
+
+    @staticmethod
+    def _red_noise_beta(residuals: np.ndarray, times: np.ndarray) -> float:
+        residuals = np.asarray(residuals, dtype=float)
+        times = np.asarray(times, dtype=float)
+        if residuals.size < 8:
+            return 1.0
+        unbinned = float(np.std(residuals, ddof=1))
+        if not math.isfinite(unbinned) or unbinned <= 0:
+            return 1.0
+        beta = 1.0
+        for minutes in (10.0, 20.0, 30.0):
+            bins = np.floor((times - times.min()) * 24.0 * 60.0 / minutes).astype(int)
+            unique = np.unique(bins)
+            if unique.size < 2:
+                continue
+            binned = np.asarray([np.mean(residuals[bins == value]) for value in unique])
+            counts = np.asarray([np.count_nonzero(bins == value) for value in unique])
+            if binned.size < 2 or np.median(counts) <= 1:
+                continue
+            expected = unbinned / math.sqrt(float(np.median(counts)))
+            expected *= math.sqrt(binned.size / (binned.size - 1))
+            if expected > 0:
+                beta = max(beta, float(np.std(binned, ddof=1)) / expected)
+        return min(beta, 5.0)
+
+    def _control_fits(
+        self,
+        times: np.ndarray,
+        flux: np.ndarray,
+        uncertainty: np.ndarray,
+        parameters: PlanetParameters,
+        expected_phase: float,
+        duration_phase: float,
+        window_phase: float,
+        baseline: str,
+    ) -> list[dict[str, Any]]:
+        controls: list[dict[str, Any]] = []
+        for offset in (-0.15, 0.15):
+            phase_center = (expected_phase + offset) % 1.0
+            phase = self._relative_phase(
+                times,
+                float(parameters.mid_time),
+                float(parameters.period),
+                phase_center,
+            )
+            fit = self._fit_window(
+                phase,
+                times,
+                flux,
+                uncertainty,
+                duration_phase=duration_phase,
+                window_phase=window_phase,
+                baseline=baseline,
+            )
+            controls.append(
+                {
+                    "phase": phase_center,
+                    "available": fit["coverage"]["available"],
+                    "significance": fit.get("significance"),
+                    "depth_ppm": self._as_ppm(fit.get("depth")),
+                    "coverage": fit["coverage"],
+                }
+            )
+        return controls
+
+    @staticmethod
+    def _strongest_control_significance(controls: list[dict[str, Any]]) -> float | None:
+        values = [abs(float(control["significance"])) for control in controls if control["significance"] is not None]
+        return max(values) if values else None
+
+    def _classify(
+        self, fit: dict[str, Any], controls: list[dict[str, Any]]
+    ) -> tuple[str, str, str]:
+        if not fit["coverage"]["available"]:
+            coverage = fit["coverage"]
+            detail = (
+                f"{coverage['in_eclipse_points']} in-eclipse points, "
+                f"{coverage['before_points']} before, and {coverage['after_points']} after."
+            )
+            return (
+                "inconclusive",
+                "Inconclusive · no usable coverage",
+                "No supported local eclipse fit was possible at the expected phase ("
+                + detail
+                + "). This light curve cannot constrain a secondary-eclipse depth.",
+            )
+        depth = float(fit["depth"])
+        significance = float(fit["significance"] or 0.0)
+        strongest_control = self._strongest_control_significance(controls)
+        controls_are_quieter = strongest_control is None or strongest_control < max(3.0, significance - 1.5)
+        if depth > 0 and significance >= 5.0 and controls_are_quieter:
+            return (
+                "candidate",
+                "Candidate signal · independent check required",
+                (
+                    f"A positive fixed-phase eclipse depth is recovered at {significance:.1f}σ. "
+                    "Treat this as a candidate signal, not a confirmation."
+                ),
+            )
+        if depth > 0 and significance >= 3.0:
+            return (
+                "marginal",
+                "Marginal signal · not a detection",
+                (
+                    f"A positive depth is present at {significance:.1f}σ, below the conservative candidate threshold. "
+                    "More eclipse coverage is needed."
+                ),
+            )
+        return (
+            "inconclusive",
+            "Inconclusive",
+            "No reliable positive secondary-eclipse depth was recovered from this approved light curve.",
+        )
+
+    @staticmethod
+    def _observed_event_count(
+        times: np.ndarray,
+        phase: np.ndarray,
+        mid_time: float,
+        period: float,
+        expected_phase: float,
+        local_mask: np.ndarray,
+    ) -> int:
+        if not np.any(local_mask):
+            return 0
+        cycles = (times[local_mask] - mid_time) / period - expected_phase
+        return int(np.unique(np.rint(cycles).astype(int)).size)
+
+    @staticmethod
+    def _as_ppm(value: float | None) -> float | None:
+        return None if value is None or not math.isfinite(float(value)) else float(value) * 1_000_000.0
+
+    @staticmethod
+    def _write_outputs(
+        destination: Path,
+        phase: np.ndarray,
+        times_bjd: np.ndarray,
+        flux: np.ndarray,
+        uncertainty: np.ndarray,
+        fit: dict[str, Any],
+        summary: dict[str, Any],
+        *,
+        duration_phase: float,
+        window_phase: float,
+    ) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        local = fit["local_mask"]
+        local_phase = phase[local]
+        local_times = times_bjd[local]
+        local_flux = flux[local]
+        local_uncertainty = uncertainty[local]
+        local_model = np.asarray(fit["model"], dtype=float)
+        local_residuals = np.asarray(fit["residuals"], dtype=float)
+        local_template = np.asarray(fit["template"], dtype=float)
+        table = np.column_stack(
+            (
+                local_times,
+                local_phase,
+                local_flux,
+                local_uncertainty,
+                local_model,
+                local_residuals,
+                local_template,
+            )
+        )
+        time_label = "BJD_TDB" if summary.get("time_standard") == "BJD_TDB" else "JD_TDB"
+        np.savetxt(
+            destination / "secondary-eclipse.csv",
+            table,
+            delimiter=",",
+            header=(
+                f"{time_label},phase_from_expected,relative_flux,relative_flux_uncertainty,"
+                "model,residual,eclipse_template"
+            ),
+            comments="",
+        )
+        (destination / "secondary-eclipse.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        _write_secondary_eclipse_preview(
+            phase,
+            flux,
+            uncertainty,
+            fit,
+            destination / "secondary-eclipse.png",
+            duration_phase=duration_phase,
+            window_phase=window_phase,
+            summary=summary,
+        )
+
+
+def _write_secondary_eclipse_preview(
+    phase: np.ndarray,
+    flux: np.ndarray,
+    uncertainty: np.ndarray,
+    fit: dict[str, Any],
+    destination: Path,
+    *,
+    duration_phase: float,
+    window_phase: float,
+    summary: dict[str, Any],
+) -> None:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    available = bool(fit["coverage"]["available"])
+    figure = Figure(figsize=(10, 7 if available else 4.8), facecolor="#0b2638", constrained_layout=True)
+    FigureCanvasAgg(figure)
+    if available:
+        axis, residual_axis = figure.subplots(2, 1, sharex=True, height_ratios=(3, 1))
+        local = fit["local_mask"]
+        local_phase = phase[local]
+        local_flux = flux[local]
+        local_uncertainty = uncertainty[local]
+        model = np.asarray(fit["model"], dtype=float)
+        baseline_model = np.asarray(fit["baseline_model"], dtype=float)
+        residuals = np.asarray(fit["residuals"], dtype=float)
+        order = np.argsort(local_phase)
+        axis.errorbar(
+            local_phase,
+            local_flux,
+            yerr=local_uncertainty,
+            fmt="o",
+            color="#c4d5e4",
+            ecolor="#52718a",
+            markersize=3.1,
+            elinewidth=0.7,
+            alpha=0.8,
+            label="Approved photometry",
+        )
+        axis.plot(local_phase[order], baseline_model[order], "--", color="#20c5f4", lw=1.8, label="No-eclipse baseline")
+        axis.plot(local_phase[order], model[order], color="#ff5b62", lw=2.4, label="Fixed-phase eclipse fit")
+        residual_axis.errorbar(
+            local_phase,
+            residuals,
+            yerr=local_uncertainty,
+            fmt="o",
+            color="#c4d5e4",
+            ecolor="#52718a",
+            markersize=3.0,
+            elinewidth=0.7,
+            alpha=0.8,
+        )
+        residual_axis.axhline(0.0, color="#ff5b62", lw=1.5)
+        residual_axis.set_ylabel("Residual")
+        residual_axis.set_xlabel("Phase from expected secondary eclipse")
+        title = summary["outcome_label"]
+        depth = summary.get("depth_ppm")
+        depth_uncertainty = summary.get("depth_uncertainty_ppm")
+        significance = summary.get("significance")
+        if depth is not None and depth_uncertainty is not None and significance is not None:
+            detail = f"Depth {depth:.0f} ± {depth_uncertainty:.0f} ppm · S/N {significance:.1f}"
+            axis.text(0.015, 0.96, detail, transform=axis.transAxes, va="top", color="#dce9f3", fontsize=10)
+    else:
+        axis = figure.subplots(1, 1)
+        axis.plot(phase, flux, "o", color="#52718a", markersize=2.8, alpha=0.6)
+        axis.text(
+            0.5,
+            0.5,
+            "No approved data cover the expected secondary-eclipse window.\n"
+            "This observation cannot constrain an occultation depth.",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color="#dce9f3",
+            fontsize=12,
+        )
+        axis.set_xlabel("Phase from expected secondary eclipse")
+        axis.set_ylabel("Relative flux")
+        axis.set_xlim(-0.5, 0.5)
+        title = "Secondary eclipse · insufficient coverage"
+    for current_axis in figure.axes:
+        current_axis.set_facecolor("#071827")
+        current_axis.tick_params(colors="#a9bdd0", labelsize=8)
+        current_axis.grid(color="#28516b", alpha=0.35)
+        for spine in current_axis.spines.values():
+            spine.set_color("#28516b")
+        current_axis.axvspan(-duration_phase / 2.0, duration_phase / 2.0, color="#20c5f4", alpha=0.10)
+        current_axis.set_xlim(-window_phase if available else -0.5, window_phase if available else 0.5)
+        current_axis.xaxis.label.set_color("#dce9f3")
+        current_axis.yaxis.label.set_color("#dce9f3")
+    axis.set_title(title, color="#ffffff", loc="left", fontsize=14, fontweight="bold")
+    if available:
+        axis.set_ylabel("Relative flux")
+        axis.legend(
+            loc="best",
+            facecolor="#0b2638",
+            edgecolor="#28516b",
+            labelcolor="#dce9f3",
+            fontsize=8,
+        )
+    figure.savefig(destination, dpi=160, facecolor=figure.get_facecolor())
+    figure.savefig(destination.with_suffix(".pdf"), facecolor=figure.get_facecolor())
 
 
 def _write_fit_preview(

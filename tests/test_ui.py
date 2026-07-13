@@ -21,6 +21,7 @@ from leaps.ui.pages import (
     LightCurvePage,
     PlateSolvePage,
     ProcessingPage,
+    SecondaryEclipsePage,
 )
 from leaps.ui.widgets import FITSWorkspace, InfoButton, StageNavButton
 
@@ -87,9 +88,42 @@ def test_light_curve_is_required_workflow_stage_not_a_tool(qapp) -> None:
     stages = list(window.stage_buttons)
     assert stages.index(StageID.LIGHT_CURVE) == stages.index(StageID.PHOTOMETRY) + 1
     assert stages.index(StageID.FITTING) == stages.index(StageID.LIGHT_CURVE) + 1
+    assert stages.index(StageID.SECONDARY_ECLIPSE) == stages.index(StageID.FITTING) + 1
     assert "light_curve" not in window.tool_buttons
     assert window.pages[StageID.LIGHT_CURVE] is window.light_curve_page
+    assert window.pages[StageID.SECONDARY_ECLIPSE] is window.secondary_eclipse_page
     window.close()
+
+
+def test_secondary_eclipse_page_needs_full_fit_context_before_analysis(qapp) -> None:
+    page = SecondaryEclipsePage()
+    assert not page.analyze.isEnabled()
+
+    from leaps.catalog import PlanetParameters
+
+    parameters = PlanetParameters(
+        name="WASP-12 b",
+        ra="06:30:32.79",
+        dec="+29:40:20.3",
+        period=1.09142,
+        mid_time=2454508.97682,
+        rp_over_rs=0.117,
+        sma_over_rs=3.0,
+        inclination=83.4,
+        eccentricity=0.0,
+        periastron=0.0,
+        metallicity=0.3,
+        temperature=6300.0,
+        logg=4.2,
+        source="ExoClock",
+    )
+    page.set_fit_context(parameters, passband="COUSINS_R", duration_hours=2.9)
+
+    assert page.analyze.isEnabled()
+    assert page.expected_phase.value() == 0.5
+    assert page.duration_hours.value() == 2.9
+    assert "WASP-12 b" in page.fit_context.text()
+    page.close()
 
 
 def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp_path) -> None:
