@@ -35,6 +35,8 @@ On Windows, activate the environment with `.venv\Scripts\activate` before runnin
 
 Raw FITS files are opened read-only. LEAPS creates a visible, portable `LEAPS/` folder inside the observing run containing `project.json`, structured logs, caches, checkpoints, and generated outputs. Moving the run folder between macOS and Windows preserves relative project references. Existing hidden `.leaps/` projects are validated and migrated automatically when opened. Data & Target can reveal this folder or safely reset only LEAPS-generated data after exact-name confirmation.
 
+To resume an existing run, use **Data & Target → Open project** and choose the observing-run folder containing `LEAPS/project.json` (or the `LEAPS` folder itself). LEAPS restores the saved workflow state without rescanning or changing raw FITS files.
+
 ## Secondary eclipse analysis
 
 Run a full primary-transit fit first, then open **Secondary Eclipse**. LEAPS carries forward the saved ephemeris and approved aperture/PSF light curve, suggests a duration from the transit geometry, and evaluates only the expected occultation phase (normally 0.50 for a circular orbit). It also fits nearby control phases and scales the depth uncertainty for time-correlated noise.

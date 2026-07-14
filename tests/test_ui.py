@@ -565,6 +565,27 @@ def test_real_project_replaces_demo_target_and_restores_counts(qapp, tmp_path) -
     window.close()
 
 
+def test_open_existing_project_accepts_run_or_leaps_folder_and_opens_eclipse(qapp, tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    root = tmp_path / "WASP-18_TESS"
+    project = ProjectWorkspace.create(root, "WASP-18 b — TESS")
+    project.manifest.target_name = "WASP-18"
+    project.manifest.stages[StageID.FITTING.value] = StageState(
+        status=StageStatus.COMPLETE, summary="Imported primary-transit fit"
+    )
+    project.save()
+
+    window = MainWindow(settings=settings)
+    window.open_existing_project(root / "LEAPS")
+    qapp.processEvents()
+
+    assert window.project is not None
+    assert window.project.root == root
+    assert window.stack.currentWidget() is window.secondary_eclipse_page
+    assert window.data_page.open_existing_project.text() == "Open project"
+    window.close()
+
+
 def test_project_reset_dialog_shows_scope_and_requires_exact_project_name(qapp, tmp_path) -> None:
     project = ProjectWorkspace.create(tmp_path, "TrES-3")
     project.manifest.raw_files["science"] = ["light_001.fits", "light_002.fits"]

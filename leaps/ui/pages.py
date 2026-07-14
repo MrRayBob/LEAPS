@@ -126,6 +126,7 @@ class DataTargetPage(QWidget):
     scanRequested = Signal(object)
     saveRequested = Signal(dict)
     targetLookupRequested = Signal(str)
+    openProjectRequested = Signal(object)
     revealProjectRequested = Signal()
     resetProjectRequested = Signal()
 
@@ -240,8 +241,18 @@ class DataTargetPage(QWidget):
             tooltip="Choose a folder containing science and calibration FITS frames.",
         )
         browse.clicked.connect(self._choose_folder)
+        self.open_existing_project = ActionButton(
+            "Open project",
+            "fa6s.folder-open",
+            tooltip=(
+                "Open an existing LEAPS project. Choose the observing-run folder that contains "
+                "LEAPS/project.json; you may also choose its LEAPS folder directly."
+            ),
+        )
+        self.open_existing_project.clicked.connect(self._open_existing_project)
         pick.addWidget(self.folder, 1)
         pick.addWidget(browse)
+        pick.addWidget(self.open_existing_project)
         folder_layout.addLayout(pick)
         self.scan_progress = QProgressBar()
         self.scan_progress.setVisible(False)
@@ -386,6 +397,11 @@ class DataTargetPage(QWidget):
             self.scan_progress.setRange(0, 0)
             self.scan_progress.setVisible(True)
             self.scanRequested.emit(Path(folder))
+
+    def _open_existing_project(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Open existing LEAPS project")
+        if folder:
+            self.openProjectRequested.emit(Path(folder))
 
     def _target_name_edited(self) -> None:
         self._lookup_requested_name = ""

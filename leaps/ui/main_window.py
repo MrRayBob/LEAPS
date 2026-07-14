@@ -405,6 +405,7 @@ class MainWindow(QMainWindow):
         self.data_page.scanRequested.connect(self.scan_folder)
         self.data_page.saveRequested.connect(self.save_data_target)
         self.data_page.targetLookupRequested.connect(self.resolve_target_name)
+        self.data_page.openProjectRequested.connect(self.open_existing_project)
         self.data_page.revealProjectRequested.connect(self.open_project_folder)
         self.data_page.resetProjectRequested.connect(self.request_project_reset)
         self.runner.busyChanged.connect(self._runner_busy_changed)
@@ -668,6 +669,33 @@ class MainWindow(QMainWindow):
             finished=self._scan_finished,
             operation="FITS header scan",
         )
+
+    def open_existing_project(self, selected_folder: Path) -> None:
+        """Open an already-created portable LEAPS project without rescanning raw FITS files."""
+        if not self._ensure_runner_idle("open a LEAPS project", StageID.DATA_TARGET):
+            return
+        root = selected_folder.expanduser().resolve()
+        if root.name in {ProjectWorkspace.WORKSPACE_NAME, ProjectWorkspace.LEGACY_WORKSPACE_NAME}:
+            root = root.parent
+        try:
+            if not ProjectWorkspace.has_project(root):
+                raise LEAPSError(
+                    "PROJECT_NOT_FOUND",
+                    "No LEAPS project was found there",
+                    "Choose the observing-run folder that contains LEAPS/project.json, not a data subfolder.",
+                    ["Choose Open project again", "Select the folder directly above LEAPS"],
+                    stage=StageID.DATA_TARGET,
+                )
+            project = ProjectWorkspace.open(root)
+            self.set_project(project)
+            fitting = project.manifest.stages[StageID.FITTING.value]
+            self.open_stage(
+                StageID.SECONDARY_ECLIPSE
+                if fitting.status == StageStatus.COMPLETE
+                else StageID.DATA_TARGET
+            )
+        except BaseException as exc:
+            self._handle_error(exc)
 
     def _nasa_snapshot_path(self) -> Path | None:
         folder = self.offline_manager.root / "nasa"
