@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import os
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,6 +26,37 @@ def is_generated_project_path(path: Path) -> bool:
         part in PROJECT_WORKSPACE_NAMES or part.startswith(".LEAPS-reset-")
         for part in path.parts
     )
+
+
+def preflight_observing_run_access(root: str | Path) -> None:
+    """Trigger folder access and verify that at least one FITS file can be opened.
+
+    On macOS, touching the user-selected folder is what allows the operating
+    system to present its Files and Folders consent prompt. Non-permission I/O
+    errors are left to the full inventory scan, which can describe damaged or
+    otherwise unreadable FITS files more accurately.
+    """
+    pending = [Path(root).expanduser()]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        if (
+                            entry.name not in PROJECT_WORKSPACE_NAMES
+                            and not entry.name.startswith(".LEAPS-reset-")
+                        ):
+                            pending.append(path)
+                    elif entry.is_file(follow_symlinks=False) and is_fits_path(path):
+                        with path.open("rb") as handle:
+                            handle.read(1)
+                        return
+        except OSError as exc:
+            if _is_access_error(exc):
+                raise _folder_access_failure(current, exc) from exc
+            return
 
 
 @dataclass(slots=True)
@@ -312,3 +344,8 @@ def _folder_access_failure(path: Path, exc: OSError) -> LEAPSError:
         stage=StageID.DATA_TARGET,
         technical_details=f"{type(exc).__name__}: {exc}",
     )
+
+
+def observing_run_access_failure(path: str | Path, exc: OSError) -> LEAPSError:
+    """Build the typed observing-run error used by later processing stages."""
+    return _folder_access_failure(Path(path), exc)

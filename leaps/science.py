@@ -17,6 +17,7 @@ import numpy as np
 
 from .catalog import PlanetParameters
 from .filters import normalize_filter, passband_label
+from .fits_inventory import observing_run_access_failure
 from .models import JobStatus, LEAPSError, StageEvent, StageID
 from .project import ProjectWorkspace
 
@@ -267,6 +268,10 @@ class ReductionService:
             try:
                 result.append(_read_fits_image(path))
             except Exception as exc:
+                if isinstance(exc, OSError):
+                    access_failure = observing_run_access_failure(path, exc)
+                    if access_failure.code == "OBSERVING_RUN_ACCESS_DENIED":
+                        raise access_failure from exc
                 raise LEAPSError(
                     "CALIBRATION_FRAME_UNREADABLE",
                     f"{path.name} could not be read",

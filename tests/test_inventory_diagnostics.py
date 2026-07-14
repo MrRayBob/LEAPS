@@ -12,6 +12,7 @@ from leaps.diagnostics import DiagnosticLogger
 from leaps.fits_inventory import (
     FITSInventory,
     is_fits_path,
+    preflight_observing_run_access,
     summarize_observation_records,
     target_from_header,
     validate_coordinates,
@@ -61,6 +62,35 @@ def test_inventory_reports_unreadable_headers_instead_of_silently_continuing(tmp
     with pytest.raises(LEAPSError) as error:
         FITSInventory(tmp_path).discover()
     assert error.value.code == "FITS_HEADERS_UNREADABLE"
+
+
+def test_selected_folder_preflight_opens_a_nested_fits_file_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / "external-ssd" / "night-1"
+    nested.mkdir(parents=True)
+    frame = nested / "light_001.fits"
+    _write_fits(frame, "Light Frame")
+    before = frame.read_bytes()
+
+    preflight_observing_run_access(tmp_path / "external-ssd")
+
+    assert frame.read_bytes() == before
+
+
+def test_selected_folder_preflight_reports_permission_denial(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def denied(_path):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("leaps.fits_inventory.os.scandir", denied)
+
+    with pytest.raises(LEAPSError) as error:
+        preflight_observing_run_access(tmp_path)
+
+    assert error.value.code == "OBSERVING_RUN_ACCESS_DENIED"
+    assert "Choose the folder again" in error.value.recovery[0]
 
 
 def test_inventory_normalizes_hops_filter_and_summarizes_science_metadata(tmp_path: Path) -> None:

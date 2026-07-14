@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -33,7 +33,12 @@ from PySide6.QtWidgets import (
 
 from leaps.catalog import PlanetParameters
 from leaps.filters import normalize_filter, passband_choices, passband_label
-from leaps.fits_inventory import FrameRecord, is_fits_path, is_generated_project_path
+from leaps.fits_inventory import (
+    FrameRecord,
+    is_fits_path,
+    is_generated_project_path,
+    preflight_observing_run_access,
+)
 from leaps.models import LEAPSError, StageEvent, StageID
 from leaps.targets import ResolvedTarget
 
@@ -60,19 +65,6 @@ def _format_duration(seconds: float | int | None) -> str:
     if minutes:
         return f"{minutes:d}m {seconds:02d}s"
     return f"{seconds:d}s"
-
-
-def _request_macos_documents_access() -> None:
-    """Trigger macOS's native protected-folder consent before choosing a run."""
-    if sys.platform != "darwin":
-        return
-    documents = Path.home() / "Documents"
-    try:
-        with os.scandir(documents) as entries:
-            next(entries, None)
-    except OSError:
-        # Denial is handled by the typed scan error after the native picker.
-        pass
 
 
 def _optional_float(value: object) -> float | None:
@@ -426,29 +418,76 @@ class DataTargetPage(QWidget):
         self.calibration_waivers = {key: False for key in ("bias", "dark", "flat")}
 
     def _choose_folder(self) -> None:
-        _request_macos_documents_access()
-        folder = QFileDialog.getExistingDirectory(
-            self,
+        selected = self._choose_accessible_folder(
             "Choose observing run",
-            str(Path.home() / "Documents"),
-            QFileDialog.Option.ShowDirsOnly,
+            self.folder.text() or str(Path.home()),
         )
-        if folder:
-            self.name.clear()
-            self.ra.clear()
-            self.dec.clear()
-            self.target_source.setVisible(False)
-            self._target_name_edited()
-            self.folder.setText(folder)
-            self.preview_folder(Path(folder))
-            self.scan_progress.setRange(0, 0)
-            self.scan_progress.setVisible(True)
-            self.scanRequested.emit(Path(folder))
+        if selected is None:
+            return
+        self.name.clear()
+        self.ra.clear()
+        self.dec.clear()
+        self.target_source.setVisible(False)
+        self._target_name_edited()
+        self.folder.setText(str(selected))
+        self.preview_folder(selected)
+        self.scan_progress.setRange(0, 0)
+        self.scan_progress.setVisible(True)
+        self.scanRequested.emit(selected)
 
     def _open_existing_project(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Open existing LEAPS project")
-        if folder:
-            self.openProjectRequested.emit(Path(folder))
+        selected = self._choose_accessible_folder(
+            "Open existing LEAPS project",
+            self.folder.text() or str(Path.home()),
+        )
+        if selected is not None:
+            self.openProjectRequested.emit(selected)
+
+    def _choose_accessible_folder(self, title: str, start: str) -> Path | None:
+        while True:
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                title,
+                start,
+                QFileDialog.Option.ShowDirsOnly,
+            )
+            if not folder:
+                return None
+            selected = Path(folder)
+            try:
+                preflight_observing_run_access(selected)
+            except LEAPSError as failure:
+                if not self._confirm_folder_access_retry(selected, failure):
+                    return None
+                start = folder
+                continue
+            return selected
+
+    def _confirm_folder_access_retry(self, folder: Path, failure: LEAPSError) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Folder access required")
+        dialog.setText(f"LEAPS cannot read files in {folder.name or folder}.")
+        if sys.platform == "darwin":
+            dialog.setInformativeText(
+                "Choose the folder again in the native macOS picker to grant access. "
+                "For an external SSD, approve the Files and Folders prompt. If macOS does "
+                "not ask, enable LEAPS under System Settings > Privacy & Security > Files and Folders."
+            )
+        else:
+            dialog.setInformativeText(
+                "Choose the folder again after granting your account read access to the folder and FITS files."
+            )
+        if failure.technical_details:
+            dialog.setDetailedText(failure.technical_details)
+        cancel = dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        grant = dialog.addButton(
+            "Choose Folder & Grant Access…", QMessageBox.ButtonRole.AcceptRole
+        )
+        dialog.setDefaultButton(grant)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return dialog.clickedButton() is grant
 
     def _choose_tess_light_curves(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(

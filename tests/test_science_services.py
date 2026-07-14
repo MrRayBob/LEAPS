@@ -131,6 +131,23 @@ def test_reduction_reads_unsigned_scaled_fits_without_changing_raw_files(
     )
 
 
+def test_reduction_preserves_permission_specific_error_for_external_frames(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+
+    def denied(_path):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("leaps.science._read_fits_image", denied)
+
+    with pytest.raises(LEAPSError) as error:
+        ReductionService._load(project, ["bias_001.fits"])
+
+    assert error.value.code == "OBSERVING_RUN_ACCESS_DENIED"
+    assert "Files and Folders" in " ".join(error.value.recovery)
+
+
 def test_cancellation_is_typed_and_recoverable() -> None:
     token = CancellationToken()
     token.cancel()

@@ -321,6 +321,111 @@ def test_data_target_page_exposes_tess_light_curve_import(qapp) -> None:
     page.close()
 
 
+def test_observing_run_picker_retries_selected_external_folder_after_access_denial(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    page = DataTargetPage()
+    starts: list[str] = []
+    selections = iter((str(tmp_path), str(tmp_path)))
+    preflight_calls: list[Path] = []
+
+    def choose(_parent, _title, start, _options):
+        starts.append(start)
+        return next(selections)
+
+    def preflight(folder: Path) -> None:
+        preflight_calls.append(folder)
+        if len(preflight_calls) == 1:
+            raise LEAPSError(
+                "OBSERVING_RUN_ACCESS_DENIED",
+                "LEAPS cannot access the observing run",
+                "The selected folder is not readable.",
+                ["Choose the folder again to grant access"],
+                stage=StageID.DATA_TARGET,
+            )
+
+    monkeypatch.setattr("leaps.ui.pages.QFileDialog.getExistingDirectory", choose)
+    monkeypatch.setattr("leaps.ui.pages.preflight_observing_run_access", preflight)
+    monkeypatch.setattr(page, "_confirm_folder_access_retry", lambda _folder, _failure: True)
+    scanned: list[Path] = []
+    page.scanRequested.connect(scanned.append)
+
+    page._choose_folder()
+
+    assert preflight_calls == [tmp_path, tmp_path]
+    assert starts[1] == str(tmp_path)
+    assert scanned == [tmp_path]
+    assert page.folder.text() == str(tmp_path)
+    page.close()
+
+
+def test_folder_access_prompt_explains_external_drive_permission(qapp, tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeMessageBox:
+        class Icon:
+            Warning = object()
+
+        class ButtonRole:
+            RejectRole = object()
+            AcceptRole = object()
+
+        def __init__(self, _parent) -> None:
+            self.grant = None
+
+        def setIcon(self, _icon) -> None:
+            pass
+
+        def setWindowTitle(self, title: str) -> None:
+            captured["title"] = title
+
+        def setText(self, message: str) -> None:
+            captured["message"] = message
+
+        def setInformativeText(self, message: str) -> None:
+            captured["information"] = message
+
+        def setDetailedText(self, details: str) -> None:
+            captured["details"] = details
+
+        def addButton(self, label: str, _role):
+            button = object()
+            if "Grant Access" in label:
+                self.grant = button
+            return button
+
+        def setDefaultButton(self, _button) -> None:
+            pass
+
+        def setEscapeButton(self, _button) -> None:
+            pass
+
+        def exec(self) -> None:
+            pass
+
+        def clickedButton(self):
+            return self.grant
+
+    monkeypatch.setattr("leaps.ui.pages.QMessageBox", FakeMessageBox)
+    monkeypatch.setattr("leaps.ui.pages.sys.platform", "darwin")
+    page = DataTargetPage()
+    failure = LEAPSError(
+        "OBSERVING_RUN_ACCESS_DENIED",
+        "LEAPS cannot access the observing run",
+        "The selected folder is not readable.",
+        ["Choose the folder again"],
+        stage=StageID.DATA_TARGET,
+        technical_details="PermissionError: Operation not permitted",
+    )
+
+    assert page._confirm_folder_access_retry(tmp_path / "External SSD", failure)
+    assert captured["title"] == "Folder access required"
+    assert "External SSD" in str(captured["message"])
+    assert "external SSD" in str(captured["information"])
+    assert "Files and Folders" in str(captured["information"])
+    page.close()
+
+
 def test_frame_assignment_counts_filename_matches_before_header_scan(qapp, tmp_path) -> None:
     for index in range(21):
         (tmp_path / f"bias_{index + 1:03d}.fits").touch()
