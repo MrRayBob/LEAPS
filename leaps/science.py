@@ -2663,10 +2663,18 @@ def _write_secondary_eclipse_preview(
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     available = bool(fit["coverage"]["available"])
-    figure = Figure(figsize=(10, 7 if available else 4.8), facecolor="#0b2638", constrained_layout=True)
+    figure = Figure(
+        figsize=(11.4, 8.1 if available else 5.2),
+        facecolor="#0b2638",
+        constrained_layout=True,
+    )
     FigureCanvasAgg(figure)
     if available:
-        axis, residual_axis = figure.subplots(2, 1, sharex=True, height_ratios=(3, 1))
+        grid = figure.add_gridspec(4, 1, height_ratios=(0.72, 3.25, 1.15, 0.08))
+        header = figure.add_subplot(grid[0])
+        axis = figure.add_subplot(grid[1])
+        residual_axis = figure.add_subplot(grid[2], sharex=axis)
+        header.set_axis_off()
         local = fit["local_mask"]
         local_phase = phase[local]
         local_flux = flux[local]
@@ -2675,41 +2683,191 @@ def _write_secondary_eclipse_preview(
         baseline_model = np.asarray(fit["baseline_model"], dtype=float)
         residuals = np.asarray(fit["residuals"], dtype=float)
         order = np.argsort(local_phase)
-        axis.errorbar(
+        period_days = _secondary_preview_period_days(summary)
+        hours_per_phase = period_days * 24.0
+        local_hours = local_phase * hours_per_phase
+        window_hours = window_phase * hours_per_phase
+        duration_hours = duration_phase * hours_per_phase
+        phase_bins = _secondary_phase_bins(
             local_phase,
             local_flux,
-            yerr=local_uncertainty,
-            fmt="o",
-            color="#c4d5e4",
-            ecolor="#52718a",
-            markersize=3.1,
-            elinewidth=0.7,
-            alpha=0.8,
-            label="Approved photometry",
-        )
-        axis.plot(local_phase[order], baseline_model[order], "--", color="#20c5f4", lw=1.8, label="No-eclipse baseline")
-        axis.plot(local_phase[order], model[order], color="#ff5b62", lw=2.4, label="Fixed-phase eclipse fit")
-        residual_axis.errorbar(
-            local_phase,
+            local_uncertainty,
             residuals,
-            yerr=local_uncertainty,
-            fmt="o",
-            color="#c4d5e4",
-            ecolor="#52718a",
-            markersize=3.0,
-            elinewidth=0.7,
-            alpha=0.8,
+            window_phase=window_phase,
         )
-        residual_axis.axhline(0.0, color="#ff5b62", lw=1.5)
-        residual_axis.set_ylabel("Residual")
-        residual_axis.set_xlabel("Phase from expected secondary eclipse")
-        title = summary["outcome_label"]
+
+        grid_phase = np.linspace(-window_phase, window_phase, 800)
+        grid_baseline = np.interp(grid_phase, local_phase[order], baseline_model[order])
+        grid_model = np.interp(grid_phase, local_phase[order], model[order])
+        grid_hours = grid_phase * hours_per_phase
+
+        logo_path = Path(__file__).resolve().parent / "assets" / "leaps-mark.png"
+        if logo_path.exists():
+            from matplotlib.image import imread
+
+            logo_axis = header.inset_axes([0.0, 0.08, 0.06, 0.84])
+            logo_axis.imshow(imread(logo_path))
+            logo_axis.set_axis_off()
+        header.text(
+            0.069,
+            0.62,
+            "LEAPS",
+            transform=header.transAxes,
+            ha="left",
+            va="center",
+            color="#f4f8fb",
+            fontsize=16,
+            fontweight="bold",
+        )
+        header.text(
+            0.069,
+            0.34,
+            "Secondary Eclipse Analysis",
+            transform=header.transAxes,
+            ha="left",
+            va="center",
+            color="#20c5f4",
+            fontsize=7.5,
+        )
+        header.text(
+            0.5,
+            0.53,
+            str(summary.get("planet", "Secondary eclipse")),
+            transform=header.transAxes,
+            ha="center",
+            va="center",
+            color="#f4f8fb",
+            fontsize=24,
+            fontweight="bold",
+        )
+        header.text(
+            1.0,
+            0.53,
+            (
+                f"Expected phase: {float(summary.get('expected_phase', 0.5)):.3f}\n"
+                f"Duration: {duration_hours:.2f} h  ·  {int(summary.get('event_count', 0))} windows"
+            ),
+            transform=header.transAxes,
+            ha="right",
+            va="center",
+            color="#dce9f3",
+            fontsize=9.5,
+            linespacing=1.3,
+        )
+
+        axis.scatter(
+            local_hours,
+            (local_flux - 1.0) * 1_000_000.0,
+            s=3.0,
+            color="#6c8fa9",
+            alpha=0.14,
+            linewidths=0,
+            rasterized=True,
+            label="Approved photometry",
+            zorder=1,
+        )
+        axis.errorbar(
+            phase_bins["phase"] * hours_per_phase,
+            (phase_bins["flux"] - 1.0) * 1_000_000.0,
+            yerr=phase_bins["uncertainty"] * 1_000_000.0,
+            fmt="o",
+            color="#f4f8fb",
+            ecolor="#94aec2",
+            markeredgecolor="#081925",
+            markersize=4.0,
+            elinewidth=0.8,
+            capsize=1.6,
+            label=f"Phase bins ({phase_bins['bin_minutes']:.1f} min)",
+            zorder=4,
+        )
+        axis.plot(
+            grid_hours,
+            (grid_baseline - 1.0) * 1_000_000.0,
+            color="#20c5f4",
+            lw=2.1,
+            label="No-eclipse baseline",
+            zorder=5,
+        )
+        axis.plot(
+            grid_hours,
+            (grid_model - 1.0) * 1_000_000.0,
+            color="#ff5b62",
+            lw=2.8,
+            label="Fixed-phase eclipse fit",
+            zorder=6,
+        )
+        axis.axhline(0.0, color="#5d7b90", lw=0.8, alpha=0.55, zorder=0)
+        axis.axvline(0.0, color="#5d7b90", lw=0.8, ls="--", alpha=0.55, zorder=0)
+        axis.axvspan(-duration_hours / 2.0, duration_hours / 2.0, color="#20c5f4", alpha=0.10)
+
         depth = summary.get("depth_ppm")
         depth_uncertainty = summary.get("depth_uncertainty_ppm")
         significance = summary.get("significance")
+        beta = summary.get("red_noise_beta")
         if depth is not None and depth_uncertainty is not None and significance is not None:
-            detail = f"Depth {depth:.0f} ± {depth_uncertainty:.0f} ppm · S/N {significance:.1f}"
-            axis.text(0.015, 0.96, detail, transform=axis.transAxes, va="top", color="#dce9f3", fontsize=10)
+            beta_detail = f"  ·  red-noise β={float(beta):.2f}" if beta is not None else ""
+            detail = (
+                f"{summary.get('outcome_label', 'Secondary eclipse')}\n"
+                f"Depth {float(depth):.0f} ± {float(depth_uncertainty):.0f} ppm  ·  S/N {float(significance):.1f}"
+                f"{beta_detail}"
+            )
+            axis.text(
+                0.015,
+                0.975,
+                detail,
+                transform=axis.transAxes,
+                ha="left",
+                va="top",
+                color="#dce9f3",
+                fontsize=9.4,
+                linespacing=1.35,
+                bbox={
+                    "boxstyle": "round,pad=0.38",
+                    "facecolor": "#0b2638",
+                    "edgecolor": "#28516b",
+                    "alpha": 0.92,
+                },
+                zorder=7,
+            )
+
+        residual_axis.scatter(
+            local_hours,
+            residuals * 1_000_000.0,
+            s=3.0,
+            color="#6c8fa9",
+            alpha=0.14,
+            linewidths=0,
+            rasterized=True,
+            zorder=1,
+        )
+        residual_axis.errorbar(
+            phase_bins["phase"] * hours_per_phase,
+            phase_bins["residual"] * 1_000_000.0,
+            yerr=phase_bins["residual_uncertainty"] * 1_000_000.0,
+            fmt="o",
+            color="#f4f8fb",
+            ecolor="#94aec2",
+            markeredgecolor="#081925",
+            markersize=4.0,
+            elinewidth=0.8,
+            capsize=1.6,
+            zorder=4,
+        )
+        residual_axis.axhline(0.0, color="#ff5b62", lw=1.6)
+        residual_axis.axvline(0.0, color="#5d7b90", lw=0.8, ls="--", alpha=0.55)
+        residual_axis.axvspan(-duration_hours / 2.0, duration_hours / 2.0, color="#20c5f4", alpha=0.10)
+        axis.set_ylabel("Relative flux (ppm)")
+        residual_axis.set_ylabel("Residual\n(ppm)")
+        residual_axis.set_xlabel("Hours from expected secondary-eclipse center")
+
+        _secondary_preview_limits(
+            axis,
+            residual_axis,
+            phase_bins,
+            grid_model,
+            grid_baseline,
+        )
+        title = str(summary.get("outcome_label", "Secondary eclipse"))
     else:
         axis = figure.subplots(1, 1)
         axis.plot(phase, flux, "o", color="#52718a", markersize=2.8, alpha=0.6)
@@ -2728,28 +2886,157 @@ def _write_secondary_eclipse_preview(
         axis.set_ylabel("Relative flux")
         axis.set_xlim(-0.5, 0.5)
         title = "Secondary eclipse · insufficient coverage"
-    for current_axis in figure.axes:
+    plot_axes = [axis] if not available else [axis, residual_axis]
+    for current_axis in plot_axes:
         current_axis.set_facecolor("#071827")
         current_axis.tick_params(colors="#a9bdd0", labelsize=8)
         current_axis.grid(color="#28516b", alpha=0.35)
         for spine in current_axis.spines.values():
             spine.set_color("#28516b")
-        current_axis.axvspan(-duration_phase / 2.0, duration_phase / 2.0, color="#20c5f4", alpha=0.10)
-        current_axis.set_xlim(-window_phase if available else -0.5, window_phase if available else 0.5)
+        if not available:
+            current_axis.axvspan(-duration_phase / 2.0, duration_phase / 2.0, color="#20c5f4", alpha=0.10)
+            current_axis.set_xlim(-0.5, 0.5)
+        else:
+            current_axis.set_xlim(-window_hours, window_hours)
         current_axis.xaxis.label.set_color("#dce9f3")
         current_axis.yaxis.label.set_color("#dce9f3")
-    axis.set_title(title, color="#ffffff", loc="left", fontsize=14, fontweight="bold")
+    if not available:
+        axis.set_title(title, color="#ffffff", loc="left", fontsize=14, fontweight="bold")
     if available:
-        axis.set_ylabel("Relative flux")
         axis.legend(
-            loc="best",
+            loc="lower left",
             facecolor="#0b2638",
             edgecolor="#28516b",
             labelcolor="#dce9f3",
-            fontsize=8,
+            fontsize=8.1,
+            ncol=2,
         )
     figure.savefig(destination, dpi=160, facecolor=figure.get_facecolor())
     figure.savefig(destination.with_suffix(".pdf"), facecolor=figure.get_facecolor())
+
+
+def _secondary_preview_period_days(summary: dict[str, Any]) -> float:
+    """Read the fitted period defensively so diagnostic plotting never blocks outputs."""
+    try:
+        period = float(summary.get("parameters", {}).get("period"))
+        if math.isfinite(period) and period > 0:
+            return period
+    except (TypeError, ValueError):
+        pass
+    return 1.0
+
+
+def _secondary_phase_bins(
+    phase: np.ndarray,
+    flux: np.ndarray,
+    uncertainty: np.ndarray,
+    residual: np.ndarray,
+    *,
+    window_phase: float,
+) -> dict[str, np.ndarray | float]:
+    """Create uncertainty-aware phase bins for a readable eclipse diagnostic.
+
+    The fit itself always uses every approved point.  Binning is display-only,
+    with a scatter-based error floor so correlated photometry is not made to
+    look more precise than it is.
+    """
+    valid = (
+        np.isfinite(phase)
+        & np.isfinite(flux)
+        & np.isfinite(uncertainty)
+        & np.isfinite(residual)
+        & (uncertainty > 0)
+    )
+    phase, flux, uncertainty, residual = (
+        np.asarray(values, dtype=float)[valid]
+        for values in (phase, flux, uncertainty, residual)
+    )
+    point_count = phase.size
+    if point_count == 0:
+        empty = np.asarray([], dtype=float)
+        return {
+            "phase": empty,
+            "flux": empty,
+            "uncertainty": empty,
+            "residual": empty,
+            "residual_uncertainty": empty,
+            "bin_minutes": 0.0,
+        }
+
+    bin_count = int(np.clip(round(math.sqrt(point_count) * 2.0), 8, 72))
+    bin_count = min(bin_count, max(2, point_count // 3))
+    edges = np.linspace(-window_phase, window_phase, bin_count + 1)
+    indices = np.clip(np.digitize(phase, edges) - 1, 0, bin_count - 1)
+    phase_values: list[float] = []
+    flux_values: list[float] = []
+    uncertainty_values: list[float] = []
+    residual_values: list[float] = []
+    residual_uncertainty_values: list[float] = []
+    for index in range(bin_count):
+        points = indices == index
+        count = int(points.sum())
+        if count < 2:
+            continue
+        weights = 1.0 / np.square(uncertainty[points])
+        weight_sum = float(weights.sum())
+        if not math.isfinite(weight_sum) or weight_sum <= 0:
+            continue
+        formal = math.sqrt(1.0 / weight_sum)
+        flux_scatter = float(np.std(flux[points], ddof=1)) / math.sqrt(count)
+        residual_scatter = float(np.std(residual[points], ddof=1)) / math.sqrt(count)
+        phase_values.append(float(np.average(phase[points], weights=weights)))
+        flux_values.append(float(np.average(flux[points], weights=weights)))
+        uncertainty_values.append(max(formal, flux_scatter))
+        residual_values.append(float(np.average(residual[points], weights=weights)))
+        residual_uncertainty_values.append(max(formal, residual_scatter))
+    return {
+        "phase": np.asarray(phase_values),
+        "flux": np.asarray(flux_values),
+        "uncertainty": np.asarray(uncertainty_values),
+        "residual": np.asarray(residual_values),
+        "residual_uncertainty": np.asarray(residual_uncertainty_values),
+        "bin_minutes": 2.0 * window_phase / max(bin_count, 1) * 24.0 * 60.0,
+    }
+
+
+def _secondary_preview_limits(
+    axis: Any,
+    residual_axis: Any,
+    bins: dict[str, np.ndarray | float],
+    model: np.ndarray,
+    baseline: np.ndarray,
+) -> None:
+    """Focus the display on the binned eclipse signal instead of raw-point scatter."""
+    binned_flux = np.asarray(bins["flux"], dtype=float)
+    binned_error = np.asarray(bins["uncertainty"], dtype=float)
+    binned_residual = np.asarray(bins["residual"], dtype=float)
+    binned_residual_error = np.asarray(bins["residual_uncertainty"], dtype=float)
+    model_ppm = (np.asarray(model, dtype=float) - 1.0) * 1_000_000.0
+    baseline_ppm = (np.asarray(baseline, dtype=float) - 1.0) * 1_000_000.0
+    signal_values = np.concatenate(
+        (
+            (binned_flux - 1.0) * 1_000_000.0 - binned_error * 1_000_000.0,
+            (binned_flux - 1.0) * 1_000_000.0 + binned_error * 1_000_000.0,
+            model_ppm,
+            baseline_ppm,
+        )
+    )
+    finite_signal = signal_values[np.isfinite(signal_values)]
+    if finite_signal.size:
+        center = float(np.median(finite_signal))
+        half_span = max(20.0, float(np.max(np.abs(finite_signal - center))) * 1.15)
+        axis.set_ylim(center - half_span, center + half_span)
+
+    residual_values = np.concatenate(
+        (
+            binned_residual * 1_000_000.0 - binned_residual_error * 1_000_000.0,
+            binned_residual * 1_000_000.0 + binned_residual_error * 1_000_000.0,
+        )
+    )
+    finite_residual = residual_values[np.isfinite(residual_values)]
+    if finite_residual.size:
+        half_span = max(20.0, float(np.max(np.abs(finite_residual))) * 1.15)
+        residual_axis.set_ylim(-half_span, half_span)
 
 
 def _write_fit_preview(

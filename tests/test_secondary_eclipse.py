@@ -8,7 +8,7 @@ from astropy.time import Time
 from leaps.catalog import PlanetParameters
 from leaps.models import ProjectManifest, StageID, StageStatus
 from leaps.project import ProjectWorkspace
-from leaps.science import SecondaryEclipseService
+from leaps.science import SecondaryEclipseService, _secondary_phase_bins
 
 
 def _parameters(mid_time: float) -> PlanetParameters:
@@ -86,6 +86,26 @@ def test_secondary_eclipse_reports_no_coverage_without_inventing_depth(tmp_path:
     assert result.local_points == 0
     assert result.preview_path.exists()
     assert "cannot constrain" in result.message
+
+
+def test_secondary_preview_uses_display_bins_without_changing_the_fit_inputs() -> None:
+    phase = np.linspace(-0.10, 0.10, 12_000)
+    flux = 1.0 + 4e-5 * phase
+    uncertainty = np.full(phase.size, 3e-4)
+    residual = flux - 1.0
+
+    binned = _secondary_phase_bins(
+        phase,
+        flux,
+        uncertainty,
+        residual,
+        window_phase=0.10,
+    )
+
+    assert 2 <= len(binned["phase"]) <= 72
+    assert np.all(np.asarray(binned["uncertainty"]) > 0)
+    assert np.all(np.asarray(binned["residual_uncertainty"]) > 0)
+    assert float(binned["bin_minutes"]) > 0
 
 
 def test_full_fit_unlocks_secondary_eclipse_stage(tmp_path: Path) -> None:
