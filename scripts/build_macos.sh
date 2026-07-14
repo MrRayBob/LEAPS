@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+PROJECT_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+VERSION="${LEAPS_VERSION:-$PROJECT_VERSION}"
+VERSION="${VERSION#v}"
+if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+  echo "LEAPS_VERSION must contain two or three numeric components (received: $VERSION)" >&2
+  exit 1
+fi
+export LEAPS_VERSION="$VERSION"
+
 python -m pip install --upgrade 'PyInstaller>=6.14,<7'
 python -m PyInstaller --noconfirm --clean packaging/LEAPS-macos.spec
 
@@ -26,8 +35,8 @@ set_plist_string() {
 set_plist_string CFBundleDisplayName "LEAPS"
 set_plist_string CFBundleName "LEAPS"
 set_plist_string CFBundleIdentifier "org.leaps.exoplanet"
-set_plist_string CFBundleShortVersionString "1.0.0"
-set_plist_string CFBundleVersion "1"
+set_plist_string CFBundleShortVersionString "$VERSION"
+set_plist_string CFBundleVersion "$VERSION"
 set_plist_string NSDocumentsFolderUsageDescription \
   "LEAPS needs access to your observing-run folder to read FITS images and save project results beside them."
 set_plist_string NSDesktopFolderUsageDescription \

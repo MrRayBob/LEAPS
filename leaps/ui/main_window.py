@@ -57,6 +57,7 @@ from leaps.science import (
     ReductionConfig,
     ReductionService,
     SecondaryEclipseService,
+    _normalize_mid_transit_time,
 )
 from leaps.targets import ResolvedTarget, TargetNameResolver
 from leaps.tess import TessImportResult, TessImportService
@@ -65,6 +66,7 @@ from .pages import (
     ComparisonStarsPage,
     DataTargetPage,
     FittingPage,
+    InspectionPage,
     LightCurvePage,
     ObservingPlannerPage,
     PlateSolvePage,
@@ -95,6 +97,41 @@ def _optional_float(value: object) -> float | None:
         return None if value in (None, "") else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _project_observatory(
+    project: ProjectWorkspace,
+    observation: dict[str, Any] | None = None,
+) -> tuple[str, float | None, float | None, str]:
+    metadata = observation or project.manifest.settings.get("observation_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    profile = project.manifest.global_profile
+    fits_name = str(metadata.get("observatory", "")).strip()
+    fits_latitude = _optional_float(metadata.get("latitude"))
+    fits_longitude = _optional_float(metadata.get("longitude"))
+    profile_name = str(profile.get("observatory", "")).strip()
+    profile_latitude = _optional_float(profile.get("latitude"))
+    profile_longitude = _optional_float(profile.get("longitude"))
+    if fits_latitude is not None and fits_longitude is not None:
+        return (
+            fits_name or profile_name,
+            fits_latitude,
+            fits_longitude,
+            "science FITS",
+        )
+    if profile_latitude is not None and profile_longitude is not None:
+        return (
+            fits_name or profile_name,
+            profile_latitude,
+            profile_longitude,
+            "Settings profile",
+        )
+    if fits_name:
+        return fits_name, None, None, "science FITS"
+    if profile_name:
+        return profile_name, None, None, "Settings profile"
+    return "", None, None, ""
 
 
 def _manual_planet_parameters(project: ProjectWorkspace) -> PlanetParameters:
@@ -248,6 +285,7 @@ class MainWindow(QMainWindow):
         self.records: list[FrameRecord] = []
         self.last_failure: LEAPSError | None = None
         self._resetting_project = False
+        self._inspection_previous_state: StageState | None = None
         self.runner = TaskRunner(self)
         self.offline_manager = OfflineDataManager(default_offline_root())
         self.target_lookup_runner = TaskRunner(self)
@@ -317,18 +355,7 @@ class MainWindow(QMainWindow):
                 ),
             ],
         )
-        self.inspection_page = ProcessingPage(
-            StageID.INSPECTION,
-            "Inspection",
-            "Review sky background and point-spread changes before alignment.",
-            [
-                (
-                    "Suggest outlier exclusions",
-                    "Flag frames with unusual sky background or PSF without removing them automatically.",
-                ),
-                ("Keep manual exclusions", "Retain user decisions when this stage is resumed or rerun."),
-            ],
-        )
+        self.inspection_page = InspectionPage(asset)
         self.alignment_page = ProcessingPage(
             StageID.ALIGNMENT,
             "Alignment",
@@ -485,9 +512,13 @@ class MainWindow(QMainWindow):
         self.data_page.resetProjectRequested.connect(self.request_project_reset)
         self.runner.busyChanged.connect(self._runner_busy_changed)
         self.fitting_lookup_runner.busyChanged.connect(self._runner_busy_changed)
-        for page in (self.reduction_page, self.inspection_page, self.alignment_page):
+        for page in (self.reduction_page, self.alignment_page):
             page.runRequested.connect(self.run_stage)
             page.cancelRequested.connect(self.runner.cancel)
+        self.inspection_page.runRequested.connect(self.run_inspection)
+        self.inspection_page.cancelRequested.connect(self.runner.cancel)
+        self.inspection_page.draftChanged.connect(self.save_inspection_draft)
+        self.inspection_page.confirmRequested.connect(self.confirm_inspection)
         self.plate_page.retryRequested.connect(self.retry_plate_solve)
         self.plate_page.copyDiagnosticsRequested.connect(self.copy_diagnostics)
         self.plate_page.starSelectionRequested.connect(self.select_photometry_star)
@@ -580,10 +611,12 @@ class MainWindow(QMainWindow):
         )
         pixel_scale = float(project.manifest.settings.get("pixel_scale", 0.0))
         self.plate_page.clear_selection()
-        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
+        reference_frame = self._photometry_reference_frame(project, require_alignment=False)
         estimated_pixel_scale = 0.0
-        if frames:
-            estimated_pixel_scale = self.plate_page.workspace.load_fits(frames[0], pixel_scale)
+        if reference_frame:
+            estimated_pixel_scale = self.plate_page.workspace.load_fits(
+                reference_frame, pixel_scale
+            )
         self.plate_page.inspector.set_project_target(
             project.manifest.target_name or "Unnamed target",
             f"{project.manifest.target_ra}  {project.manifest.target_dec}",
@@ -635,6 +668,7 @@ class MainWindow(QMainWindow):
                 label=project.manifest.target_name or "Target",
                 verified=not bool(solution.get("unverified", False)),
             )
+        self._load_inspection_page(project)
         self._apply_manifest(project.manifest)
         self.project_label.setText(project.manifest.name)
         self.status_text.setText("Session saved")
@@ -718,12 +752,61 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pages[stage])
         for key, button in self.stage_buttons.items():
             button.set_active(key == stage)
-        if stage == StageID.LIGHT_CURVE and self.project:
+        if stage == StageID.INSPECTION and self.project:
+            self._load_inspection_page(self.project)
+        elif stage == StageID.LIGHT_CURVE and self.project:
             self.review_light_curves()
         elif stage == StageID.FITTING and self.project:
             self.prepare_fitting_setup()
         elif stage == StageID.SECONDARY_ECLIPSE and self.project:
             self.prepare_secondary_eclipse_setup()
+
+    def _load_inspection_page(self, project: ProjectWorkspace) -> None:
+        if isinstance(project.manifest.settings.get("tess_import"), dict):
+            self.inspection_page.set_mission_state(
+                "TESS mission quality flags were applied during import; individual reduced-frame inspection is not applicable."
+            )
+            return
+        try:
+            result = InspectionService.load(project, required=False)
+        except LEAPSError as failure:
+            self.inspection_page.set_failure(failure)
+            return
+        if result is None:
+            self.inspection_page.set_empty()
+            return
+        self.inspection_page.set_result(
+            result,
+            project.outputs_dir / StageID.REDUCTION.value,
+        )
+
+    @staticmethod
+    def _photometry_reference_frame(
+        project: ProjectWorkspace,
+        *,
+        require_alignment: bool = True,
+    ) -> Path | None:
+        alignment_complete = (
+            project.manifest.stages[StageID.ALIGNMENT.value].status
+            == StageStatus.COMPLETE
+        )
+        if alignment_complete:
+            return AlignmentService.successful_frames(project)[0]
+        if require_alignment:
+            raise LEAPSError(
+                "PHOTOMETRY_ALIGNMENT_MISSING",
+                "Complete Alignment before Photometry",
+                "The current confirmed frame list has not been aligned yet.",
+                ["Open Alignment"],
+                stage=StageID.PHOTOMETRY,
+            )
+        try:
+            return InspectionService.confirmed_frames(project)[0]
+        except LEAPSError:
+            reduced = sorted(
+                (project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*")
+            )
+            return reduced[0] if reduced else None
 
     def open_tool(self, key: str) -> None:
         self.stack.setCurrentWidget(self.pages[key])
@@ -996,6 +1079,201 @@ class MainWindow(QMainWindow):
         dialog.exec()
         return dialog.clickedButton() is acknowledge
 
+    def run_inspection(self) -> None:
+        if not self.project:
+            return
+        if not self._ensure_runner_idle("run Inspection", StageID.INSPECTION):
+            return
+        self._inspection_previous_state = replace(
+            self.project.manifest.stages[StageID.INSPECTION.value],
+            warning_codes=list(
+                self.project.manifest.stages[StageID.INSPECTION.value].warning_codes
+            ),
+        )
+        self.inspection_page.set_busy(True)
+        self.project.set_stage(
+            StageID.INSPECTION,
+            StageStatus.RUNNING,
+            "Reading frame metrics",
+            progress=0.0,
+        )
+        self._apply_manifest(self.project.manifest)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Running Inspection…")
+        self.runner.start(
+            InspectionService().run,
+            self.project,
+            event=self._stage_event,
+            result=self._inspection_scan_complete,
+            error=self._inspection_scan_failed,
+            finished=lambda: self.inspection_page.set_busy(False),
+            operation="Inspection",
+        )
+
+    def _inspection_scan_complete(self, result: Any) -> None:
+        if not self.project:
+            return
+        previous_complete = bool(
+            self._inspection_previous_state
+            and self._inspection_previous_state.status == StageStatus.COMPLETE
+        )
+        if previous_complete and not result.confirmed:
+            self._invalidate_after_inspection(None, None)
+        status = StageStatus.COMPLETE if result.confirmed else StageStatus.READY
+        summary = (
+            f"{result.included_count} included · {result.excluded_count} excluded"
+            if result.confirmed
+            else f"Review {len(result.frames)} frames"
+        )
+        self.project.set_stage(
+            StageID.INSPECTION,
+            status,
+            summary,
+            progress=1.0,
+            output_path=(
+                self.project.outputs_dir
+                / StageID.INSPECTION.value
+                / "inspection.json"
+            ),
+        )
+        self.inspection_page.set_result(
+            result,
+            self.project.outputs_dir / StageID.REDUCTION.value,
+        )
+        self._apply_manifest(self.project.manifest)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Inspection ready for review")
+        self.autosave.setText("autosaved just now")
+
+    def _inspection_scan_failed(self, exc: BaseException) -> None:
+        if not self.project:
+            return
+        cancelled = isinstance(exc, LEAPSError) and exc.code == "JOB_CANCELLED"
+        if self._inspection_previous_state is not None:
+            self.project.manifest.stages[StageID.INSPECTION.value] = replace(
+                self._inspection_previous_state,
+                warning_codes=list(self._inspection_previous_state.warning_codes),
+            )
+            self.project.save()
+        elif not cancelled:
+            self.project.set_stage(
+                StageID.INSPECTION,
+                StageStatus.NEEDS_ATTENTION,
+                "Needs attention",
+            )
+        self._apply_manifest(self.project.manifest)
+        if cancelled:
+            self.inspection_page.set_cancelled()
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("Inspection cancelled safely")
+            return
+        failure = self._as_failure(exc, StageID.INSPECTION)
+        self.inspection_page.set_failure(failure)
+        self._show_failure(failure)
+
+    def save_inspection_draft(self, exclusions: dict[str, bool]) -> None:
+        if not self.project:
+            return
+        try:
+            InspectionService.save_draft(self.project, exclusions)
+            self.autosave.setText("autosaved just now")
+        except BaseException as exc:
+            self._handle_error(exc)
+
+    def confirm_inspection(self, exclusions: dict[str, bool]) -> None:
+        if not self.project:
+            return
+        if not self._ensure_runner_idle(
+            "confirm Inspection", StageID.INSPECTION
+        ):
+            return
+        try:
+            previous = InspectionService.load(
+                self.project, include_draft=False, required=False
+            )
+            previous_exclusions = (
+                {
+                    str(record["file"]): bool(record.get("excluded"))
+                    for record in previous.frames
+                }
+                if previous and previous.confirmed
+                else {}
+            )
+            previous_reference = self._first_included_name(previous)
+            result = InspectionService.confirm(self.project, exclusions)
+            current_exclusions = {
+                str(record["file"]): bool(record.get("excluded"))
+                for record in result.frames
+            }
+            changed = bool(previous_exclusions) and previous_exclusions != current_exclusions
+            if changed:
+                self._invalidate_after_inspection(
+                    previous_reference,
+                    self._first_included_name(result),
+                )
+            self.project.set_stage(
+                StageID.INSPECTION,
+                StageStatus.COMPLETE,
+                f"{result.included_count} included · {result.excluded_count} excluded",
+                progress=1.0,
+                output_path=(
+                    self.project.outputs_dir
+                    / StageID.INSPECTION.value
+                    / "inspection.json"
+                ),
+            )
+            self.inspection_page.set_result(
+                result,
+                self.project.outputs_dir / StageID.REDUCTION.value,
+            )
+            self._apply_manifest(self.project.manifest)
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("Frame inspection confirmed")
+            self.autosave.setText("autosaved just now")
+            self.open_stage(StageID.ALIGNMENT)
+        except BaseException as exc:
+            failure = self._as_failure(exc, StageID.INSPECTION)
+            self.inspection_page.set_failure(failure)
+            self._show_failure(failure)
+
+    @staticmethod
+    def _first_included_name(result: Any | None) -> str | None:
+        if result is None:
+            return None
+        return next(
+            (
+                str(record.get("file"))
+                for record in result.frames
+                if not record.get("excluded")
+            ),
+            None,
+        )
+
+    def _invalidate_after_inspection(
+        self,
+        previous_reference: str | None,
+        current_reference: str | None,
+    ) -> None:
+        if not self.project:
+            return
+        self.project.manifest.stages[StageID.ALIGNMENT.value] = StageState(
+            status=StageStatus.READY,
+            summary="Inspection changed · rerun alignment",
+        )
+        for stage in (
+            StageID.PHOTOMETRY,
+            StageID.LIGHT_CURVE,
+            StageID.FITTING,
+            StageID.SECONDARY_ECLIPSE,
+        ):
+            self.project.manifest.stages[stage.value] = StageState()
+        self.project.manifest.settings.pop("light_curve_review", None)
+        if previous_reference is None or previous_reference != current_reference:
+            self.project.manifest.settings.pop("plate_solution", None)
+            self.project.manifest.settings.pop("photometry", None)
+            self.plate_page.clear_selection()
+        self.project.save()
+
     def run_stage(self, stage: StageID) -> None:
         if not self.project:
             self._handle_error(
@@ -1014,7 +1292,6 @@ class MainWindow(QMainWindow):
         assert isinstance(page, ProcessingPage)
         functions = {
             StageID.REDUCTION: (ReductionService().run, {"config": ReductionConfig()}),
-            StageID.INSPECTION: (InspectionService().run, {}),
             StageID.ALIGNMENT: (AlignmentService().run, {}),
         }
         function, kwargs = functions[stage]
@@ -1143,6 +1420,9 @@ class MainWindow(QMainWindow):
         page = self.pages[event.stage]
         if isinstance(page, ProcessingPage):
             page.update_event(event)
+        elif isinstance(page, InspectionPage):
+            page.update_event(event)
+            self.status_text.setText(event.message)
         elif isinstance(page, FittingPage):
             page.update_event(event)
             self.status_text.setText(event.message)
@@ -1182,6 +1462,21 @@ class MainWindow(QMainWindow):
         self.status_text.setText(f"{STAGE_LABELS[stage]} complete")
         self.autosave.setText("autosaved just now")
         if stage == StageID.REDUCTION and self.project:
+            self.project.manifest.stages[StageID.INSPECTION.value] = StageState(
+                status=StageStatus.READY,
+                summary="Run Inspection",
+            )
+            for downstream in (
+                StageID.ALIGNMENT,
+                StageID.PHOTOMETRY,
+                StageID.LIGHT_CURVE,
+                StageID.FITTING,
+                StageID.SECONDARY_ECLIPSE,
+            ):
+                self.project.manifest.stages[downstream.value] = StageState()
+            self.project.manifest.settings.pop("light_curve_review", None)
+            self.project.save()
+            self._apply_manifest(self.project.manifest)
             frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
             if frames:
                 pixel_scale = float(self.project.manifest.settings.get("pixel_scale", 0.0))
@@ -1189,6 +1484,13 @@ class MainWindow(QMainWindow):
                     frames[0], pixel_scale
                 )
                 self.plate_page.inspector.set_pixel_scale(pixel_scale, estimated_pixel_scale)
+            self._load_inspection_page(self.project)
+        elif stage == StageID.ALIGNMENT and self.project:
+            reference = self._photometry_reference_frame(self.project)
+            if reference:
+                pixel_scale = float(self.project.manifest.settings.get("pixel_scale", 0.0))
+                estimated = self.plate_page.workspace.load_fits(reference, pixel_scale)
+                self.plate_page.inspector.set_pixel_scale(pixel_scale, estimated)
         elif stage == StageID.PHOTOMETRY:
             self.plate_page.inspector.banner_title.setText("Photometry complete")
             self.plate_page.inspector.banner_title.setStyleSheet(
@@ -1232,21 +1534,15 @@ class MainWindow(QMainWindow):
             return
         if not self._ensure_runner_idle("retry plate solving", StageID.PHOTOMETRY):
             return
-        frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
-        if not frames:
-            self._handle_error(
-                LEAPSError(
-                    "PLATE_FRAME_REQUIRED",
-                    "No reduced image is available",
-                    "Run Reduction before plate solving.",
-                    ["Open Reduction"],
-                    stage=StageID.PHOTOMETRY,
-                )
-            )
+        try:
+            frame = self._photometry_reference_frame(self.project)
+        except LEAPSError as failure:
+            self._handle_error(failure)
             return
+        assert frame is not None
         self.runner.start(
             PlateSolveService().solve,
-            frames[0],
+            frame,
             self.project.manifest.target_ra,
             self.project.manifest.target_dec,
             float(self.project.manifest.settings.get("pixel_scale", 0.0)),
@@ -1459,15 +1755,8 @@ class MainWindow(QMainWindow):
                 "Choose an observing run before photometry.",
                 ["Open Data & Target"],
             )
-        frames = sorted((self.project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
-        if not frames:
-            raise LEAPSError(
-                "PHOTOMETRY_FRAME_REQUIRED",
-                "No reduced frame is available",
-                "Run Reduction before ranking comparison stars.",
-                ["Open Reduction"],
-                stage=StageID.PHOTOMETRY,
-            )
+        frame = self._photometry_reference_frame(self.project)
+        assert frame is not None
         target = self.plate_page.target
         if target is None and require_target:
             raise LEAPSError(
@@ -1477,7 +1766,7 @@ class MainWindow(QMainWindow):
                 ["Open Photometry"],
                 stage=StageID.PHOTOMETRY,
             )
-        return frames[0], target
+        return frame, target
 
     def rank_comparison_stars(self) -> None:
         if not self._ensure_runner_idle("rank comparison stars", StageID.PHOTOMETRY):
@@ -1598,7 +1887,27 @@ class MainWindow(QMainWindow):
         project = self.project
         fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
         cached = project.manifest.settings.get("fitting_setup", {})
-        if not force and cached.get("target_fingerprint") == fingerprint:
+        cached_observation = cached.get("observation", {})
+        has_science = bool(project.manifest.raw_files.get("science"))
+        location_refresh_needed = has_science and (
+            not isinstance(cached_observation, dict)
+            or "location_status" not in cached_observation
+        )
+        cached_exposure = (
+            _optional_float(cached_observation.get("exposure_time"))
+            if isinstance(cached_observation, dict)
+            else None
+        )
+        cached_override = _optional_float(cached.get("exposure_time_override"))
+        exposure_refresh_needed = has_science and not (
+            cached_override is not None and cached_override > 0
+        ) and (cached_exposure is None or cached_exposure <= 0)
+        if (
+            not force
+            and not location_refresh_needed
+            and not exposure_refresh_needed
+            and cached.get("target_fingerprint") == fingerprint
+        ):
             try:
                 candidates = [PlanetParameters(**values) for values in cached["candidates"]]
                 if candidates:
@@ -1640,6 +1949,8 @@ class MainWindow(QMainWindow):
         self.fitting_page.set_loading("Matching the selected target and reading science FITS headers…")
         self.status_text.setText("Preparing fitting setup…")
         saved_observation = project.manifest.settings.get("observation_metadata", {})
+        if not isinstance(saved_observation, dict):
+            saved_observation = {}
         assigned_science = list(project.manifest.raw_files.get("science", []))
         current_records = list(self.records)
 
@@ -1651,7 +1962,19 @@ class MainWindow(QMainWindow):
                 requested_name or project.manifest.target_name,
             )
             observation = saved_observation
-            if int(observation.get("science_frames_inspected", 0)) != len(assigned_science):
+            refresh_location = bool(assigned_science) and (
+                "location_status" not in observation
+            )
+            saved_exposure = _optional_float(observation.get("exposure_time"))
+            refresh_exposure = bool(assigned_science) and (
+                saved_exposure is None or saved_exposure <= 0
+            )
+            if (
+                int(observation.get("science_frames_inspected", 0))
+                != len(assigned_science)
+                or refresh_location
+                or refresh_exposure
+            ):
                 by_path = {record.path: record for record in current_records}
                 records: list[FrameRecord] = []
                 inventory = FITSInventory(project.root)
@@ -1659,7 +1982,21 @@ class MainWindow(QMainWindow):
                     if token:
                         token.raise_if_cancelled()
                     record = by_path.get(relative_path)
-                    if record is None or (not record.filter_name and record.exposure is None):
+                    record_exposure = (
+                        _optional_float(record.exposure) if record is not None else None
+                    )
+                    if (
+                        record is None
+                        or not record.filter_name
+                        or record_exposure is None
+                        or record_exposure <= 0
+                        or (
+                            refresh_location
+                            and not record.observatory
+                            and record.observatory_latitude is None
+                            and record.observatory_longitude is None
+                        )
+                    ):
                         record = inventory.inspect(project.resolve(relative_path))
                     records.append(record)
                 observation = summarize_observation_records(records, assigned_science)
@@ -1700,20 +2037,40 @@ class MainWindow(QMainWindow):
         if fingerprint != expected_fingerprint:
             return
         previous = project.manifest.settings.get("fitting_setup", {})
-        latitude = _optional_float(project.manifest.global_profile.get("latitude"))
-        longitude = _optional_float(project.manifest.global_profile.get("longitude"))
+        observatory, latitude, longitude, observatory_source = _project_observatory(
+            project, observation
+        )
         tess_import = isinstance(project.manifest.settings.get("tess_import"), dict)
         default_light_curve = "aperture" if tess_import else "gaussian"
         default_detrending = "linear" if tess_import else "quadratic"
         light_curve = str(previous.get("light_curve", default_light_curve))
         detrending = str(previous.get("detrending", default_detrending))
+        exposure_override = _optional_float(previous.get("exposure_time_override"))
+        if exposure_override is not None and exposure_override <= 0:
+            exposure_override = None
+        detected_exposure = _optional_float(observation.get("exposure_time"))
+        if detected_exposure is not None and detected_exposure <= 0:
+            detected_exposure = None
+        saved_exposure = _optional_float(project.manifest.settings.get("exposure_time"))
+        if saved_exposure is not None and saved_exposure <= 0:
+            saved_exposure = None
+        effective_exposure = exposure_override or detected_exposure or saved_exposure
+        exposure_source = (
+            "manual override"
+            if exposure_override is not None
+            else "science FITS"
+            if detected_exposure is not None
+            else "saved project"
+            if saved_exposure is not None
+            else ""
+        )
         candidate_names = {parameters.name.casefold(): parameters.name for parameters in candidates}
         selected_name = candidate_names.get(preferred_name.casefold(), "") if preferred_name else ""
         if not selected_name and not preferred_name:
             previous_name = str(previous.get("selected_planet", ""))
             selected_name = candidate_names.get(previous_name.casefold(), "")
         selected_name = selected_name or candidates[0].name
-        project.manifest.settings["fitting_setup"] = {
+        fitting_setup = {
             "target_fingerprint": fingerprint,
             "selected_planet": selected_name or candidates[0].name,
             "candidates": [asdict(parameters) for parameters in candidates],
@@ -1721,6 +2078,9 @@ class MainWindow(QMainWindow):
             "light_curve": light_curve,
             "detrending": detrending,
         }
+        if exposure_override is not None:
+            fitting_setup["exposure_time_override"] = exposure_override
+        project.manifest.settings["fitting_setup"] = fitting_setup
         project.manifest.settings["observation_metadata"] = observation
         detected_filter = normalize_filter(observation.get("filter"))
         if detected_filter:
@@ -1732,17 +2092,26 @@ class MainWindow(QMainWindow):
         self.fitting_page.set_fitting_options(light_curve, detrending)
         self.fitting_page.set_observation_metadata(
             str(project.manifest.settings.get("filter", "")) or None,
-            float(project.manifest.settings["exposure_time"])
-            if project.manifest.settings.get("exposure_time")
-            else None,
+            effective_exposure,
             filter_status=str(observation.get("filter_status", "unknown")),
+            exposure_source=exposure_source,
         )
         if tess_import:
+            self.fitting_page.set_observatory_metadata(
+                "TESS", None, None, source="mission metadata"
+            )
             self.fitting_page.observation_source.setText(
                 self.fitting_page.observation_source.text()
                 + " · primary transit will be BLS-refined and phase-folded before the HOPS fit"
             )
-        elif latitude is None or longitude is None:
+        else:
+            self.fitting_page.set_observatory_metadata(
+                observatory,
+                latitude,
+                longitude,
+                source=observatory_source,
+            )
+        if not tess_import and (latitude is None or longitude is None):
             self.fitting_page.observation_source.setText(
                 self.fitting_page.observation_source.text()
                 + " · observer location not set; Airmass de-trending requires a location"
@@ -1808,6 +2177,24 @@ class MainWindow(QMainWindow):
             "run the full fit" if full else "build a fit preview", StageID.FITTING
         ):
             return
+        values = dict(values)
+        try:
+            observation_times = np.atleast_1d(
+                np.loadtxt(approved_curve, usecols=(0,), dtype=float)
+            )
+            entered_mid_time = float(values.get("mid_time", 0.0))
+            normalized_mid_time = _normalize_mid_transit_time(
+                entered_mid_time, observation_times
+            )
+            values["mid_time"] = normalized_mid_time
+            if normalized_mid_time != entered_mid_time:
+                signals_were_blocked = self.fitting_page.mid_time.blockSignals(True)
+                self.fitting_page.mid_time.setValue(normalized_mid_time)
+                self.fitting_page.mid_time.blockSignals(signals_were_blocked)
+        except (OSError, TypeError, ValueError):
+            # FittingService retains the authoritative typed light-curve error.
+            # Do not replace it with a UI-only failure while preparing the setup.
+            pass
         parameters = values.get("catalog_parameters")
         if not isinstance(parameters, PlanetParameters):
             self._handle_error(
@@ -1865,23 +2252,31 @@ class MainWindow(QMainWindow):
                 )
             )
             return
-        exposure_time = self.project.manifest.settings.get("exposure_time")
-        if not exposure_time:
+        entered_exposure = _optional_float(values.get("exposure_time"))
+        saved_exposure = _optional_float(
+            self.project.manifest.settings.get("exposure_time")
+        )
+        exposure_time = (
+            entered_exposure
+            if entered_exposure is not None and entered_exposure > 0
+            else saved_exposure
+        )
+        if exposure_time is None or exposure_time <= 0:
             self._handle_error(
                 LEAPSError(
                     "FITTING_EXPOSURE_REQUIRED",
-                    "Science exposure time was not found",
-                    "The assigned science FITS do not provide a usable exposure time.",
-                    ["Return to Data & Target", "Confirm the science frames", "Retry"],
+                    "Enter the science exposure time",
+                    "The assigned science FITS do not provide a usable exposure time, so enter the duration of one frame on the Fitting page.",
+                    ["Enter a positive exposure time", "Check the science FITS header", "Retry Preview Fit"],
                     stage=StageID.FITTING,
                 )
             )
             return
 
-        profile = self.project.manifest.global_profile
         tess_import = isinstance(self.project.manifest.settings.get("tess_import"), dict)
-        latitude = None if tess_import else _optional_float(profile.get("latitude"))
-        longitude = None if tess_import else _optional_float(profile.get("longitude"))
+        _, detected_latitude, detected_longitude, _ = _project_observatory(self.project)
+        latitude = None if tess_import else detected_latitude
+        longitude = None if tess_import else detected_longitude
         project = self.project
         setup = project.manifest.settings.get("fitting_setup", {})
         setup["selected_planet"] = parameters.name
@@ -1889,9 +2284,23 @@ class MainWindow(QMainWindow):
         default_detrending = "linear" if tess_import else "quadratic"
         setup["light_curve"] = str(values.get("light_curve", default_light_curve))
         setup["detrending"] = str(values.get("detrending", default_detrending))
+        observation = setup.get("observation", {})
+        detected_exposure = (
+            _optional_float(observation.get("exposure_time"))
+            if isinstance(observation, dict)
+            else None
+        )
+        if entered_exposure is not None and entered_exposure > 0:
+            if detected_exposure is not None and np.isclose(
+                entered_exposure, detected_exposure
+            ):
+                setup.pop("exposure_time_override", None)
+            else:
+                setup["exposure_time_override"] = float(entered_exposure)
         if parameters.is_manual:
             setup["candidates"] = [asdict(parameters)]
         project.manifest.settings["filter"] = filter_name
+        project.manifest.settings["exposure_time"] = float(exposure_time)
         project.manifest.settings["fitting_setup"] = setup
         project.save()
 
@@ -2117,9 +2526,7 @@ class MainWindow(QMainWindow):
             return
         if not self._ensure_runner_idle("analyse a secondary eclipse", StageID.SECONDARY_ECLIPSE):
             return
-        profile = project.manifest.global_profile
-        latitude = _optional_float(profile.get("latitude"))
-        longitude = _optional_float(profile.get("longitude"))
+        _, latitude, longitude, _ = _project_observatory(project)
         fingerprint = target_fingerprint(project.manifest.target_ra, project.manifest.target_dec)
         setup = {
             "target_fingerprint": fingerprint,

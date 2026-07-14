@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import math
 import os
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +16,20 @@ from .models import LEAPSError, StageID
 
 FITS_EXTENSIONS = {".fits", ".fit", ".fts", ".fz"}
 PROJECT_WORKSPACE_NAMES = {"LEAPS", ".leaps"}
+
+
+def normalized_fits_header(header: Any) -> Any:
+    """Return a standards-compliant copy of an Astropy FITS header.
+
+    Some camera software writes recoverable cards such as unquoted sexagesimal
+    RA/DEC strings.  Astropy can read the image but refuses to write a copied
+    header until those cards are normalized.  Repairing the copied cards keeps
+    the source FITS file byte-for-byte unchanged.
+    """
+    normalized = header.copy()
+    for card in normalized.cards:
+        card.verify("silentfix")
+    return normalized
 
 
 def is_fits_path(path: Path) -> bool:
@@ -76,6 +92,9 @@ class FrameRecord:
     target_ra: str = ""
     target_dec: str = ""
     filter_name: str = ""
+    observatory: str = ""
+    observatory_latitude: float | None = None
+    observatory_longitude: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -121,18 +140,29 @@ def target_from_header(header: dict[str, object]) -> tuple[str, str, str]:
     )
     try:
         if ra is not None and dec is not None:
-            if isinstance(ra, (int, float)) or ":" not in str(ra):
+            ra_text = str(ra).strip()
+            dec_text = str(dec).strip()
+            try:
+                ra_degrees = float(ra_text)
+                dec_degrees = float(dec_text)
+            except ValueError:
+                normalized_ra, normalized_dec = validate_coordinates(
+                    ":".join(ra_text.split()),
+                    ":".join(dec_text.split()),
+                )
+                return name, normalized_ra, normalized_dec
+            else:
                 import astropy.units as units
                 from astropy.coordinates import SkyCoord
 
-                coordinate = SkyCoord(float(ra), float(dec), unit=(units.deg, units.deg))
+                coordinate = SkyCoord(
+                    ra_degrees, dec_degrees, unit=(units.deg, units.deg)
+                )
                 return (
                     name,
                     coordinate.ra.to_string(unit=units.hourangle, sep=":", precision=2),
                     coordinate.dec.to_string(unit=units.deg, sep=":", precision=2, alwayssign=True),
                 )
-            normalized_ra, normalized_dec = validate_coordinates(str(ra).strip(), str(dec).strip())
-            return name, normalized_ra, normalized_dec
         if header.get("CRVAL1") is not None and header.get("CRVAL2") is not None:
             import astropy.units as units
             from astropy.coordinates import SkyCoord
@@ -146,6 +176,71 @@ def target_from_header(header: dict[str, object]) -> tuple[str, str, str]:
     except (TypeError, ValueError, LEAPSError):
         pass
     return name, "", ""
+
+
+def observatory_from_header(
+    header: dict[str, object],
+) -> tuple[str, float | None, float | None]:
+    """Extract an observing-site label and east-positive coordinates."""
+    name = next(
+        (
+            str(header.get(key, "")).strip()
+            for key in (
+                "OBSERVAT",
+                "OBSERVATORY",
+                "SITENAME",
+                "SITE",
+                "TELESCOP",
+            )
+            if str(header.get(key, "")).strip()
+        ),
+        "",
+    )
+    latitude = _header_angle(
+        header,
+        ("SITELAT", "LATITUDE", "OBS-LAT", "OBSLAT", "LAT-OBS", "GEOLAT", "OBSGEO-B"),
+    )
+    longitude = _header_angle(
+        header,
+        (
+            "SITELONG",
+            "SITELON",
+            "LONGITUD",
+            "LONGITUDE",
+            "OBS-LONG",
+            "OBSLONG",
+            "LON-OBS",
+            "GEOLON",
+            "OBSGEO-L",
+        ),
+    )
+    if latitude is not None and not -90 <= latitude <= 90:
+        latitude = None
+    if longitude is not None:
+        longitude = (longitude + 180.0) % 360.0 - 180.0
+    return name, latitude, longitude
+
+
+def _header_angle(
+    header: dict[str, object], keys: tuple[str, ...]
+) -> float | None:
+    for key in keys:
+        value = header.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            angle = float(value)
+        except (TypeError, ValueError):
+            try:
+                import astropy.units as units
+                from astropy.coordinates import Angle
+
+                angle = float(Angle(str(value).strip(), unit=units.deg).deg)
+            except (TypeError, ValueError):
+                continue
+        if math.isfinite(angle):
+            return angle
+    return None
 
 
 class FITSInventory:
@@ -209,18 +304,19 @@ class FITSInventory:
                 hdu = next(
                     (candidate for candidate in hdus if getattr(candidate, "data", None) is not None), hdus[0]
                 )
-                header = dict(hdu.header)
+                safe_header = normalized_fits_header(hdu.header)
+                header = dict(safe_header)
                 shape = tuple(hdu.shape) if hdu.shape else None
-                bitpix = int(hdu.header.get("BITPIX", 0)) or None
+                bitpix = int(safe_header.get("BITPIX", 0)) or None
                 for key in ("EXPTIME", "EXPOSURE", "EXP_TIME"):
-                    if key in hdu.header:
-                        exposure = float(hdu.header[key])
+                    if key in safe_header:
+                        exposure = float(safe_header[key])
                         break
                 raw_filter = next(
                     (
-                        hdu.header.get(key)
+                        safe_header.get(key)
                         for key in ("FILTER", "FILT", "FILTER1", "FILTER2")
-                        if hdu.header.get(key) not in (None, "")
+                        if safe_header.get(key) not in (None, "")
                     ),
                     "",
                 )
@@ -232,6 +328,9 @@ class FITSInventory:
             pass
         category, confidence, reason = classify_frame(path, header)
         target_name, target_ra, target_dec = target_from_header(header)
+        observatory, observatory_latitude, observatory_longitude = observatory_from_header(
+            header
+        )
         return FrameRecord(
             path=path.relative_to(self.root).as_posix(),
             category=category,
@@ -245,6 +344,9 @@ class FITSInventory:
             target_ra=target_ra,
             target_dec=target_dec,
             filter_name=filter_name,
+            observatory=observatory,
+            observatory_latitude=observatory_latitude,
+            observatory_longitude=observatory_longitude,
         )
 
     @staticmethod
@@ -278,6 +380,13 @@ def summarize_observation_records(
         if (canonical := normalize_filter(record.filter_name)) is not None
     }
     exposures = [record.exposure for record in science if record.exposure and record.exposure > 0]
+    observatory_names = [record.observatory for record in science if record.observatory]
+    locations = [
+        (record.observatory_latitude, record.observatory_longitude)
+        for record in science
+        if record.observatory_latitude is not None
+        and record.observatory_longitude is not None
+    ]
     if len(filters) == 1:
         filter_name = next(iter(filters))
         filter_status = "detected"
@@ -287,6 +396,26 @@ def summarize_observation_records(
     else:
         filter_name = None
         filter_status = "unknown"
+    observatory = Counter(observatory_names).most_common(1)[0][0] if observatory_names else ""
+    latitude: float | None = None
+    longitude: float | None = None
+    if locations:
+        latitudes = [float(location[0]) for location in locations]
+        longitudes = [float(location[1]) for location in locations]
+        if max(latitudes) - min(latitudes) <= 0.01 and max(longitudes) - min(longitudes) <= 0.01:
+            latitude = float(median(latitudes))
+            longitude = float(median(longitudes))
+            location_status = "detected"
+        else:
+            location_status = "mixed"
+    elif any(
+        record.observatory_latitude is not None
+        or record.observatory_longitude is not None
+        for record in science
+    ):
+        location_status = "partial"
+    else:
+        location_status = "unknown"
     return {
         "filter": filter_name,
         "filter_status": filter_status,
@@ -294,6 +423,11 @@ def summarize_observation_records(
         "exposure_time": float(median(exposures)) if exposures else None,
         "science_frames_inspected": len(science),
         "source": "science_fits",
+        "observatory": observatory,
+        "latitude": latitude,
+        "longitude": longitude,
+        "location_status": location_status,
+        "location_source": "science_fits" if observatory or locations else "unknown",
     }
 
 

@@ -200,6 +200,11 @@ class ActionButton(QPushButton):
             self.setIcon(QIcon())
         self._refresh_style()
 
+    def set_idle_text(self, text: str) -> None:
+        self._idle_text = text
+        if not self.property("running"):
+            self.setText(text)
+
     def set_primary(self, primary: bool) -> None:
         self._primary = primary
         self.setProperty("primary", primary)

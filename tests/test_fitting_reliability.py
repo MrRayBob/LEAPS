@@ -9,13 +9,19 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from astropy.io import fits
 from PIL import Image
 
 from leaps.catalog import PlanetCatalogResolver, PlanetParameters
 from leaps.filters import normalize_filter, passband_label
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageStatus, target_fingerprint
 from leaps.project import ProjectWorkspace
-from leaps.science import CancellationToken, FittingService, _write_fit_preview
+from leaps.science import (
+    CancellationToken,
+    FittingService,
+    _normalize_mid_transit_time,
+    _write_fit_preview,
+)
 from leaps.ui.main_window import MainWindow, _manual_planet_parameters
 from leaps.ui.pages import FittingPage
 
@@ -59,6 +65,23 @@ def test_hops_filter_aliases_normalize_fits_and_ui_names() -> None:
     assert normalize_filter("SDSS r'") == "sdss_r"
     assert normalize_filter("not-a-real-filter") is None
     assert passband_label("COUSINS_R") == "Cousins R"
+
+
+@pytest.mark.parametrize(
+    ("entered", "expected"),
+    [
+        (2459065.5097, 2459065.5097),
+        (9065.5097, 2459065.5097),
+        (59065.5097, 2459065.5097),
+        (0.5097, 2459065.5097),
+    ],
+)
+def test_mid_transit_shorthand_is_expanded_around_observation(
+    entered: float, expected: float
+) -> None:
+    times = np.linspace(2459065.38, 2459065.53, 50)
+
+    assert _normalize_mid_transit_time(entered, times) == pytest.approx(expected)
 
 
 def test_catalog_candidates_prefer_the_requested_planet_at_project_coordinates(monkeypatch) -> None:
@@ -139,11 +162,20 @@ def test_fitting_page_has_no_demo_target_and_requires_preview_before_full_fit(
 
     page.set_planet_candidates([_parameters()])
     page.set_observation_metadata("Cousins_R", 30.0)
+    page.set_observatory_metadata(
+        "SARA-ORM", 28.76117, -17.87808, source="science FITS"
+    )
     assert page.planet.currentText() == "TrES-3b"
     assert page.period.value() == pytest.approx(1.306186314)
     assert page.values()["filter"] == "COUSINS_R"
+    assert page.values()["exposure_time"] == pytest.approx(30.0)
+    assert page.exposure_time.value() == pytest.approx(30.0)
     assert page.values()["light_curve"] == "gaussian"
     assert page.values()["detrending"] == "quadratic"
+    assert "SARA-ORM" in page.observatory.text()
+    assert "science FITS" in page.observatory.text()
+    assert page.values()["observatory_latitude"] == pytest.approx(28.76117)
+    assert page.values()["observatory_longitude"] == pytest.approx(-17.87808)
     assert "walkers" not in page.values()
     assert not hasattr(page, "walkers")
     assert page.preview.isEnabled()
@@ -175,6 +207,23 @@ def test_fitting_page_has_no_demo_target_and_requires_preview_before_full_fit(
     assert not page.full.isEnabled()
     assert page.preview.property("primary") is True
     assert page.full.property("primary") is False
+    page.close()
+
+
+def test_fitting_page_requires_or_accepts_manual_exposure_time(qapp) -> None:
+    page = FittingPage()
+    page.set_planet_candidates([_parameters()])
+    page.set_observation_metadata("COUSINS_R", None)
+
+    assert page.exposure_time.value() == 0
+    assert not page.preview.isEnabled()
+    assert "enter it above" in page.observation_source.text()
+
+    page.exposure_time.setValue(30.0)
+
+    assert page.preview.isEnabled()
+    assert page.values()["exposure_time"] == pytest.approx(30.0)
+    assert page.values()["exposure_time_source"] == "manual override"
     page.close()
 
 
@@ -271,6 +320,7 @@ def test_cached_fitting_setup_defaults_to_project_target(qapp, tmp_path) -> None
                 "selected_planet": "TrES-3b",
                 "light_curve": "gaussian",
                 "detrending": "quadratic",
+                "exposure_time_override": 45.0,
                 "candidates": [asdict(_parameters())],
                 "observation": {
                     "filter": "COUSINS_R",
@@ -291,7 +341,71 @@ def test_cached_fitting_setup_defaults_to_project_target(qapp, tmp_path) -> None
     assert window.fitting_page.values()["catalog_parameters"].name == "TrES-3b"
     assert window.fitting_page.values()["light_curve"] == "gaussian"
     assert window.fitting_page.values()["detrending"] == "quadratic"
+    assert window.fitting_page.values()["exposure_time"] == pytest.approx(45.0)
+    assert "manual fitting override" in window.fitting_page.observation_source.text()
     assert "COUSINS_R" in window.fitting_page.observation_source.text()
+    window.close()
+
+
+def test_fitting_setup_refreshes_missing_cached_exposure_from_science_fits(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    frame = tmp_path / "science_001.fits"
+    fits.writeto(
+        frame,
+        np.ones((16, 16), dtype=np.float32),
+        header=fits.Header(
+            {
+                "IMAGETYP": "Light Frame",
+                "EXPTIME": 30.0,
+                "FILTER": "Clear",
+            }
+        ),
+    )
+    project = ProjectWorkspace.create(tmp_path, "TrES-3")
+    project.manifest.target_name = "TrES-3"
+    project.manifest.target_ra = "17:52:06.99"
+    project.manifest.target_dec = "+37:32:46.15"
+    project.manifest.raw_files["science"] = [frame.name]
+    project.manifest.settings["observation_metadata"] = {
+        "filter": "clear",
+        "filter_status": "detected",
+        "exposure_time": None,
+        "science_frames_inspected": 1,
+        "location_status": "unavailable",
+    }
+    project.manifest.settings["fitting_setup"] = {
+        "target_fingerprint": target_fingerprint(
+            project.manifest.target_ra, project.manifest.target_dec
+        ),
+        "selected_planet": "TrES-3b",
+        "candidates": [asdict(_parameters())],
+        "observation": dict(project.manifest.settings["observation_metadata"]),
+        "light_curve": "gaussian",
+        "detrending": "quadratic",
+    }
+    project.save()
+    window = MainWindow(demo=True)
+    window.set_project(project)
+
+    monkeypatch.setattr(
+        PlanetCatalogResolver,
+        "resolve_candidates",
+        lambda *_args, **_kwargs: [_parameters()],
+    )
+
+    def run_immediately(function, **kwargs):
+        payload = function()
+        kwargs["result"](payload)
+        kwargs["finished"]()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(window.fitting_lookup_runner, "start", run_immediately)
+
+    window.prepare_fitting_setup()
+
+    assert window.fitting_page.exposure_time.value() == pytest.approx(30.0)
+    assert project.manifest.settings["observation_metadata"]["exposure_time"] == pytest.approx(30.0)
     window.close()
 
 
@@ -433,8 +547,14 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
     project.manifest.target_name = "WTS-2"
     project.manifest.target_ra = "19:34:55.87"
     project.manifest.target_dec = "+36:48:56.00"
-    _write_approved_curve(project)
+    times, _ = _write_approved_curve(project)
     project.manifest.settings["exposure_time"] = 120.0
+    project.manifest.settings["observation_metadata"] = {
+        "observatory": "SARA-ORM",
+        "latitude": 28.76117,
+        "longitude": -17.87808,
+        "location_status": "detected",
+    }
     project.save()
     parameters = _manual_planet_parameters(project)
     window = MainWindow(demo=True)
@@ -457,7 +577,7 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
         "planet": "WTS-2 manual",
         "catalog_parameters": parameters,
         "period": 1.0187068,
-        "mid_time": parameters.mid_time,
+        "mid_time": float(np.median(times) % 1),
         "depth": parameters.rp_over_rs**2,
         "sma_over_rs": 9.75,
         "inclination": 87.2,
@@ -467,6 +587,7 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
         "logg": 4.2,
         "metallicity": -0.15,
         "filter": "COUSINS_R",
+        "exposure_time": 45.0,
         "light_curve": "aperture",
         "detrending": "linear",
         "iterations": 5000,
@@ -481,9 +602,17 @@ def test_manual_values_are_persisted_and_passed_to_fitting_service(
     assert fitted.name == "WTS-2 manual"
     assert fitted.is_manual is True
     assert fitted.period == pytest.approx(1.0187068)
+    assert fitted.mid_time == pytest.approx(float(np.median(times)))
+    assert window.fitting_page.mid_time.value() == pytest.approx(float(np.median(times)))
     assert fitted.sma_over_rs == pytest.approx(9.75)
     assert fitted.inclination == pytest.approx(87.2)
     assert fitted.temperature == pytest.approx(6250)
+    fit_kwargs = captured["fit_kwargs"]
+    assert isinstance(fit_kwargs, dict)
+    assert fit_kwargs["latitude"] == pytest.approx(28.76117)
+    assert fit_kwargs["longitude"] == pytest.approx(-17.87808)
+    assert fit_kwargs["exposure_time"] == pytest.approx(45.0)
+    assert project.manifest.settings["fitting_setup"]["exposure_time_override"] == pytest.approx(45.0)
     cached = project.manifest.settings["fitting_setup"]["candidates"][0]
     assert cached == asdict(fitted)
     window.close()
@@ -527,6 +656,7 @@ _AUTO_PREDICTION = object()
 
 
 class _FakePlanet:
+    last_args = None
     last_observation = None
     last_fit = None
     last_prediction = None
@@ -534,6 +664,7 @@ class _FakePlanet:
 
     def __init__(self, *args):
         self.args = args
+        type(self).last_args = args
 
     def add_observation(self, **kwargs):
         type(self).last_observation = kwargs
@@ -606,6 +737,7 @@ class _FakePlanet:
 
 
 def _install_fake_fitting_modules(monkeypatch) -> None:
+    _FakePlanet.last_args = None
     _FakePlanet.last_observation = None
     _FakePlanet.last_fit = None
     _FakePlanet.last_prediction = None
@@ -665,6 +797,74 @@ def test_preview_fit_uses_hops_passband_and_does_not_override_walkers_or_commit_
     assert "walkers" not in _FakePlanet.last_fit
     assert _FakePlanet.last_fit["optimiser"] == "curve_fit"
     assert project.manifest.stages[StageID.FITTING.value].status == StageStatus.LOCKED
+
+
+def test_preview_fit_normalizes_fractional_mid_transit_before_building_hops_planet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _install_fake_fitting_modules(monkeypatch)
+    project = ProjectWorkspace.create(tmp_path)
+    light_curve_output = project.outputs_dir / StageID.LIGHT_CURVE.value
+    light_curve_output.mkdir()
+    time = np.linspace(2460000.0, 2460000.1, 12)
+    np.savetxt(
+        light_curve_output / "light_curve_aperture.txt",
+        np.column_stack((time, np.ones(12), np.full(12, 0.001))),
+    )
+
+    FittingService().run(
+        project,
+        replace(_parameters(), mid_time=0.05),
+        full=False,
+        exposure_time=30.0,
+        filter_name="COUSINS_R",
+        latitude=None,
+        longitude=None,
+    )
+
+    assert _FakePlanet.last_args[-1] == pytest.approx(2460000.05)
+    summary = json.loads(
+        (project.temporary_dir / "fitting-preview.json").read_text(encoding="utf-8")
+    )
+    assert summary["timing_input"] == {
+        "entered_mid_time": pytest.approx(0.05),
+        "normalized_mid_time": pytest.approx(2460000.05),
+    }
+    assert summary["parameters"]["mid_time"] == pytest.approx(2460000.05)
+
+
+def test_hops_eclipse_classification_is_reported_as_timing_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _install_fake_fitting_modules(monkeypatch)
+    project = ProjectWorkspace.create(tmp_path)
+    light_curve_output = project.outputs_dir / StageID.LIGHT_CURVE.value
+    light_curve_output.mkdir()
+    time = np.linspace(2460000.0, 2460000.1, 12)
+    np.savetxt(
+        light_curve_output / "light_curve_aperture.txt",
+        np.column_stack((time, np.ones(12), np.full(12, 0.001))),
+    )
+
+    def reject_as_eclipse(_self, **_kwargs):
+        raise _PyLCInputError("You need to add only transit observation to proceed.")
+
+    monkeypatch.setattr(_FakePlanet, "transit_fitting", reject_as_eclipse)
+
+    with pytest.raises(LEAPSError) as error:
+        FittingService().run(
+            project,
+            replace(_parameters(), mid_time=9065.5097),
+            full=False,
+            exposure_time=30.0,
+            filter_name="COUSINS_R",
+            latitude=None,
+            longitude=None,
+        )
+
+    assert error.value.code == "FITTING_TIMING_CLASSIFIED_AS_ECLIPSE"
+    assert "Normalized mid-transit: 2459065.50970000" in error.value.technical_details
+    assert "decimal-day fraction" in error.value.recovery[0]
 
 
 def test_preview_fit_omits_isolated_nonfinite_light_curve_rows(

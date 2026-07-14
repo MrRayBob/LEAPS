@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -12,6 +13,7 @@ from leaps.diagnostics import DiagnosticLogger
 from leaps.fits_inventory import (
     FITSInventory,
     is_fits_path,
+    observatory_from_header,
     preflight_observing_run_access,
     summarize_observation_records,
     target_from_header,
@@ -33,6 +35,28 @@ def _write_fits(
     fits.writeto(path, np.arange(64, dtype=np.uint16).reshape(8, 8), header=header)
 
 
+def _write_fits_with_unquoted_coordinates(path: Path) -> None:
+    header = fits.Header(
+        {
+            "IMAGETYP": "Light Frame",
+            "EXPTIME": 30.0,
+            "RA": "23 54 40.53",
+            "DEC": "-37 37 41.61",
+        }
+    )
+    fits.writeto(path, np.arange(64, dtype=np.uint16).reshape(8, 8), header=header)
+    contents = bytearray(path.read_bytes())
+    for keyword, value, comment in (
+        ("RA", "23 54 40.53", "Right Ascension"),
+        ("DEC", "-37 37 41.61", "Declination"),
+    ):
+        marker = f"{keyword:<8}=".encode("ascii")
+        offset = contents.index(marker)
+        replacement = f"{keyword:<8}= {value:<20} / {comment}".ljust(80)
+        contents[offset : offset + 80] = replacement.encode("ascii")
+    path.write_bytes(contents)
+
+
 def test_inventory_reads_headers_only_and_groups_frames(tmp_path: Path) -> None:
     _write_fits(tmp_path / "light_001.fits", "Light Frame")
     _write_fits(tmp_path / "master_dark.fit", "Dark Frame")
@@ -43,6 +67,19 @@ def test_inventory_reads_headers_only_and_groups_frames(tmp_path: Path) -> None:
     assert len(grouped["dark"]) == 1
     assert len(grouped["flat"]) == 1
     assert all(record.shape == (8, 8) for record in records)
+
+
+def test_inventory_repairs_unquoted_coordinate_cards_in_memory(tmp_path: Path) -> None:
+    frame = tmp_path / "LTT-9779_001.fits"
+    _write_fits_with_unquoted_coordinates(frame)
+    before = hashlib.sha256(frame.read_bytes()).hexdigest()
+
+    record = FITSInventory(tmp_path).discover()[0]
+
+    assert record.shape == (8, 8)
+    assert record.target_ra.startswith("23:54:40.53")
+    assert record.target_dec.startswith("-37:37:41.61")
+    assert hashlib.sha256(frame.read_bytes()).hexdigest() == before
 
 
 @pytest.mark.parametrize("filename", ["image.fits", "image.fit", "image.fts", "IMAGE.FIT"])
@@ -121,6 +158,32 @@ def test_inventory_normalizes_hops_filter_and_summarizes_science_metadata(tmp_pa
     assert metadata["exposure_time"] == 31.0
 
 
+def test_inventory_detects_observatory_and_coordinates_from_science_fits(
+    tmp_path: Path,
+) -> None:
+    for name in ("light_001.fits", "light_002.fits"):
+        path = tmp_path / name
+        _write_fits(path, "Light Frame", 60.0, "Cousins_R")
+        fits.setval(path, "TELESCOP", value="SARA-ORM")
+        fits.setval(path, "SITELAT", value=28.76117)
+        fits.setval(path, "SITELONG", value=-17.87808)
+
+    records = FITSInventory(tmp_path).discover()
+    metadata = summarize_observation_records(records)
+
+    name, latitude, longitude = observatory_from_header(
+        {"OBSERVAT": "Example", "OBS-LAT": "+28:45:40", "OBS-LONG": "-17:52:41"}
+    )
+    assert name == "Example"
+    assert latitude == pytest.approx(28.761111, abs=1e-6)
+    assert longitude == pytest.approx(-17.878056, abs=1e-6)
+    assert {record.observatory for record in records} == {"SARA-ORM"}
+    assert metadata["observatory"] == "SARA-ORM"
+    assert metadata["latitude"] == pytest.approx(28.76117)
+    assert metadata["longitude"] == pytest.approx(-17.87808)
+    assert metadata["location_status"] == "detected"
+
+
 def test_observation_metadata_requires_user_choice_for_mixed_filters(tmp_path: Path) -> None:
     _write_fits(tmp_path / "light_r.fits", "Light Frame", 30.0, "Cousins_R")
     _write_fits(tmp_path / "light_v.fits", "Light Frame", 30.0, "V")
@@ -168,6 +231,12 @@ def test_target_coordinates_are_normalized_from_common_fits_headers() -> None:
     assert name == "TrES-3 b"
     assert ra.startswith("17:52:07")
     assert dec.startswith("+37:32:46")
+
+    _, spaced_ra, spaced_dec = target_from_header(
+        {"RA": "23 54 40.53", "DEC": "-37 37 41.61"}
+    )
+    assert spaced_ra.startswith("23:54:40.53")
+    assert spaced_dec.startswith("-37:37:41.61")
 
     _, wcs_ra, wcs_dec = target_from_header({"CRVAL1": 268.029161, "CRVAL2": 37.546166})
     assert wcs_ra.startswith("17:52:07")

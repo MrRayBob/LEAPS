@@ -2,6 +2,19 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
+$ProjectVersion = [string](python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not read the LEAPS version from pyproject.toml"
+}
+$Version = if ($env:LEAPS_VERSION) { $env:LEAPS_VERSION.Trim() } else { $ProjectVersion.Trim() }
+if ($Version.StartsWith("v")) {
+    $Version = $Version.Substring(1)
+}
+if ($Version -notmatch '^\d+(\.\d+){1,2}$') {
+    throw "LEAPS_VERSION must contain two or three numeric components (received: $Version)"
+}
+$env:LEAPS_VERSION = $Version
+
 python -m pip install --upgrade "PyInstaller>=6.14,<7"
 python -m PyInstaller --noconfirm --clean packaging/LEAPS-windows.spec
 
@@ -36,7 +49,7 @@ if ($IsccCommand) {
         throw "Inno Setup 6 was not found on the Windows runner"
     }
 }
-& $IsccPath "/DSourceDir=$SourceDir" packaging/leaps.iss
+& $IsccPath "/DSourceDir=$SourceDir" "/DMyAppVersion=$Version" packaging/leaps.iss
 $Installer = "artifacts/LEAPS-Windows-x64-Setup.exe"
 if (!(Test-Path $Installer)) {
     throw "The Windows installer was not produced"

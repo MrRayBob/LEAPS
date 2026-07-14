@@ -14,11 +14,13 @@ import leaps.ui.main_window as main_window_module
 from leaps.fits_inventory import FrameRecord
 from leaps.models import JobStatus, LEAPSError, StageEvent, StageID, StageState, StageStatus
 from leaps.project import ProjectWorkspace
+from leaps.science import InspectionResult
 from leaps.ui.main_window import MainWindow, ProjectResetDialog
 from leaps.ui.pages import (
     ComparisonStarsPage,
     DataTargetPage,
     FittingPage,
+    InspectionPage,
     LightCurvePage,
     PlateSolvePage,
     ProcessingPage,
@@ -177,6 +179,130 @@ def test_secondary_eclipse_page_reloads_saved_setup_and_flags_strong_control(qap
     assert "Nearby control phase: 5.6σ" in page.message.text()
     assert "review" in page.metric_values["control"].text()
     page.close()
+
+
+def test_inspection_page_links_plots_and_saves_individual_frame_decisions(
+    qapp, tmp_path: Path
+) -> None:
+    reduction = tmp_path / "reduction"
+    reduction.mkdir()
+    frames = []
+    for index in range(3):
+        name = f"r_{index:05d}.fits"
+        fits.writeto(
+            reduction / name,
+            np.full((32, 32), 100.0 + index, dtype=np.float32),
+            fits.Header({"BITPIX": -32, "HOPSPSF": 2.0}),
+        )
+        frames.append(
+            {
+                "file": name,
+                "index": index + 1,
+                "jd": 2460000.0 + index / 1440,
+                "elapsed_hours": index / 60,
+                "sky": 100.0 + index,
+                "sky_std": 5.0,
+                "psf": 2.0 + index / 10,
+                "hard_excluded": index == 2,
+                "hard_exclusion_reason": "Invalid PSF" if index == 2 else "",
+                "manual_excluded": False,
+                "excluded": index == 2,
+                "suggest_exclude": index == 1,
+            }
+        )
+    result = InspectionResult(
+        frames,
+        median_sky=101.0,
+        median_psf=2.1,
+        included_count=2,
+        excluded_count=1,
+        suggested_count=1,
+        time_axis="elapsed_hours",
+    )
+    page = InspectionPage(tmp_path / "missing-preview.png")
+    page.resize(1200, 800)
+    page.show()
+    page.set_result(result, reduction)
+    qapp.processEvents()
+
+    assert page.run.text() == "Run Inspection Again"
+    assert page.psf_plot.time_axis == "elapsed_hours"
+    assert page.include_review.property("activeToggle") is True
+    assert page.exclude_review.property("cancelActive") is True
+    drafts = []
+    page.draftChanged.connect(drafts.append)
+    page.exclude_review.click()
+    assert drafts[-1]["r_00001.fits"] is True
+    assert page.sky_plot.frames[1]["excluded"] is True
+    assert page.sky_plot.frames[0]["excluded"] is False
+    assert page.sky_plot.frames[2]["excluded"] is True
+    page.include_review.click()
+    assert drafts[-1]["r_00001.fits"] is False
+    assert page.sky_plot.frames[1]["excluded"] is False
+    assert page.sky_plot.frames[2]["excluded"] is True
+
+    point = page.sky_plot._points[1][1].toPoint()
+    QTest.mouseClick(page.sky_plot, Qt.MouseButton.LeftButton, pos=point)
+    qapp.processEvents()
+    assert page.selected_index == 1
+    assert page.psf_plot.selected_index == 1
+    assert "Suggested for review" in page.frame_status.text()
+
+    page.exclude.click()
+    assert drafts[-1]["r_00001.fits"] is True
+    assert page.exclude.property("cancelActive") is True
+    assert page.sky_plot.frames[1]["excluded"] is True
+    page.include.click()
+    assert page.include.property("activeToggle") is True
+
+    page.select_frame(2)
+    assert not page.include.isEnabled()
+    assert not page.exclude.isEnabled()
+    assert "Invalid PSF" in page.frame_status.text()
+    page.close()
+
+
+def test_inspection_change_invalidates_downstream_and_only_clears_changed_reference(
+    qapp, tmp_path: Path
+) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(settings=settings)
+    project = ProjectWorkspace.create(tmp_path / "project")
+    for stage in (
+        StageID.ALIGNMENT,
+        StageID.PHOTOMETRY,
+        StageID.LIGHT_CURVE,
+        StageID.FITTING,
+        StageID.SECONDARY_ECLIPSE,
+    ):
+        project.manifest.stages[stage.value] = StageState(
+            status=StageStatus.COMPLETE,
+            summary="Complete",
+        )
+    project.manifest.settings.update(
+        {
+            "plate_solution": {"target_xy": [10, 20]},
+            "photometry": {"target": [10, 20]},
+            "fitting_setup": {"manual": True},
+            "light_curve_review": {"active_comparisons": [True]},
+        }
+    )
+    project.save()
+    window.project = project
+
+    window._invalidate_after_inspection("r_00001.fits", "r_00001.fits")
+    assert project.manifest.stages[StageID.ALIGNMENT.value].status == StageStatus.READY
+    assert project.manifest.stages[StageID.PHOTOMETRY.value].status == StageStatus.LOCKED
+    assert "plate_solution" in project.manifest.settings
+    assert "photometry" in project.manifest.settings
+    assert "fitting_setup" in project.manifest.settings
+    assert "light_curve_review" not in project.manifest.settings
+
+    window._invalidate_after_inspection("r_00001.fits", "r_00002.fits")
+    assert "plate_solution" not in project.manifest.settings
+    assert "photometry" not in project.manifest.settings
+    assert "fitting_setup" in project.manifest.settings
+    window.close()
 
 
 def test_light_curve_page_defaults_comparisons_on_and_keeps_one_active(qapp, tmp_path) -> None:

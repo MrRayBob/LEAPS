@@ -5,8 +5,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QTime, QTimer, Signal
-from PySide6.QtGui import QDoubleValidator, QPixmap
+import numpy as np
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTime, QTimer, Signal
+from PySide6.QtGui import QColor, QDoubleValidator, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -745,6 +746,574 @@ class DataTargetPage(QWidget):
             card.style().unpolish(card)
             card.style().polish(card)
             QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(card, 20, 20))
+
+
+class InspectionPlot(QWidget):
+    frameSelected = Signal(int)
+
+    def __init__(
+        self,
+        metric: str,
+        title: str,
+        *,
+        show_time_axis: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.metric_key = metric
+        self.title = title
+        self.show_time_axis = show_time_axis
+        self.frames: list[dict[str, Any]] = []
+        self.time_axis = "elapsed_hours"
+        self.selected_index = -1
+        self._points: list[tuple[int, QPointF]] = []
+        self.setMinimumHeight(82 if show_time_axis else 72)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.setAccessibleName(title)
+        self.setToolTip("Click a point to inspect its FITS frame. Use the arrow keys to move between frames.")
+
+    def set_frames(self, frames: list[dict[str, Any]], time_axis: str) -> None:
+        self.frames = frames
+        self.time_axis = time_axis
+        self.selected_index = min(max(self.selected_index, 0), len(frames) - 1)
+        self.update()
+
+    def set_selected(self, index: int) -> None:
+        self.selected_index = index if 0 <= index < len(self.frames) else -1
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(COLORS["canvas"]))
+        painter.setPen(QColor(COLORS["text"]))
+        painter.drawText(12, 18, self.title)
+        plot = QRectF(68, 25, max(20, self.width() - 84), max(20, self.height() - 56))
+        painter.setPen(QPen(QColor(COLORS["border"]), 1))
+        painter.drawRect(plot)
+        if not self.frames:
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, "Run Inspection to load frame metrics")
+            return
+
+        x_values = [self._x_value(record, index) for index, record in enumerate(self.frames)]
+        y_values = [self._finite(record.get(self.metric_key)) for record in self.frames]
+        finite_y = [value for value in y_values if value is not None]
+        if not finite_y:
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, "No finite values")
+            return
+        x_min, x_max = min(x_values), max(x_values)
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        y_min, y_max = min(finite_y), max(finite_y)
+        y_padding = max((y_max - y_min) * 0.08, abs(y_max) * 0.01, 1e-6)
+        y_min -= y_padding
+        y_max += y_padding
+
+        painter.setPen(QPen(QColor(COLORS["border_soft"]), 1, Qt.PenStyle.DotLine))
+        for step in range(1, 5):
+            fraction = step / 5
+            x = plot.left() + fraction * plot.width()
+            y = plot.top() + fraction * plot.height()
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+
+        painter.setPen(QColor(COLORS["muted"]))
+        y_tick_count = 3 if plot.height() < 80 else 6
+        for step in range(y_tick_count):
+            fraction = step / (y_tick_count - 1)
+            value = y_max - fraction * (y_max - y_min)
+            painter.drawText(
+                QRectF(2, plot.top() + fraction * plot.height() - 9, 60, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"{value:.3g}",
+            )
+        if self.show_time_axis:
+            for step in range(6):
+                fraction = step / 5
+                value = x_min + fraction * (x_max - x_min)
+                painter.drawText(
+                    QRectF(plot.left() + fraction * plot.width() - 30, plot.bottom() + 4, 60, 17),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                    f"{value:.2g}",
+                )
+            axis = (
+                "Time from first exposure (hours)"
+                if self.time_axis == "elapsed_hours"
+                else "Frame sequence"
+            )
+            painter.drawText(
+                QRectF(plot.left(), self.height() - 18, plot.width(), 16),
+                Qt.AlignmentFlag.AlignCenter,
+                axis,
+            )
+
+        self._points = []
+        for index, (x_value, y_value) in enumerate(zip(x_values, y_values, strict=True)):
+            if y_value is None:
+                continue
+            x = plot.left() + (x_value - x_min) / (x_max - x_min) * plot.width()
+            y = plot.bottom() - (y_value - y_min) / (y_max - y_min) * plot.height()
+            point = QPointF(x, y)
+            self._points.append((index, point))
+            record = self.frames[index]
+            color = (
+                COLORS["red"]
+                if record.get("excluded")
+                else COLORS["amber"]
+                if record.get("suggest_exclude")
+                else COLORS["green"]
+            )
+            radius = 3.2 if index == self.selected_index else 2.4
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(point, radius, radius)
+            if index == self.selected_index:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(COLORS["cyan"]), 2))
+                painter.drawEllipse(point, 6.2, 6.2)
+                painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self._nearest(event.position(), maximum_distance=15.0)
+            if index is not None:
+                self.frameSelected.emit(index)
+                self.setFocus()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        index = self._nearest(event.position(), maximum_distance=10.0)
+        if index is None:
+            self.setToolTip("Click a point to inspect its FITS frame. Use the arrow keys to move between frames.")
+        else:
+            record = self.frames[index]
+            value = self._finite(record.get(self.metric_key))
+            detail = f"{self.title}: {value:.5g}" if value is not None else "Value unavailable"
+            self.setToolTip(
+                f"Frame {record.get('index', index + 1)} · {record.get('file', '')}\n{detail}"
+            )
+        super().mouseMoveEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+            self.frameSelected.emit(max(0, self.selected_index - 1))
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+            self.frameSelected.emit(min(len(self.frames) - 1, self.selected_index + 1))
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _nearest(self, point: QPointF, maximum_distance: float) -> int | None:
+        if not self._points:
+            return None
+        distance, index = min(
+            (
+                (candidate.x() - point.x()) ** 2 + (candidate.y() - point.y()) ** 2,
+                index,
+            )
+            for index, candidate in self._points
+        )
+        return index if distance <= maximum_distance**2 else None
+
+    def _x_value(self, record: dict[str, Any], index: int) -> float:
+        key = "elapsed_hours" if self.time_axis == "elapsed_hours" else "index"
+        value = self._finite(record.get(key))
+        return value if value is not None else float(index)
+
+    @staticmethod
+    def _finite(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if np.isfinite(number) else None
+
+
+class InspectionPage(QWidget):
+    runRequested = Signal()
+    cancelRequested = Signal()
+    draftChanged = Signal(dict)
+    confirmRequested = Signal(dict)
+
+    def __init__(self, asset: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.frames: list[dict[str, Any]] = []
+        self.reduction_dir: Path | None = None
+        self.selected_index = -1
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(
+            PageHeader(
+                "Inspection",
+                "Review individual reduced frames and exclude unusable images before alignment.",
+            )
+        )
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(22, 18, 22, 22)
+        layout.setSpacing(14)
+        plots = QFrame()
+        plots.setObjectName("card")
+        plots_layout = QVBoxLayout(plots)
+        plots_layout.setContentsMargins(12, 10, 12, 10)
+        plots_layout.setSpacing(4)
+        self.sky_plot = InspectionPlot(
+            "sky", "Sky background (counts/pixel)", show_time_axis=False
+        )
+        self.psf_plot = InspectionPlot(
+            "psf", "PSF max. HWHM (pixels)", show_time_axis=True
+        )
+        for plot in (self.sky_plot, self.psf_plot):
+            plot.frameSelected.connect(self.select_frame)
+            plots_layout.addWidget(plot, 1)
+        plots.setMinimumHeight(180)
+        layout.addWidget(plots, 2)
+
+        lower = QHBoxLayout()
+        lower.setSpacing(14)
+        self.workspace = FITSWorkspace(asset)
+        self.workspace.image.setMinimumSize(440, 160)
+        lower.addWidget(self.workspace, 1)
+
+        inspector = QFrame()
+        inspector.setObjectName("card")
+        inspector.setMinimumWidth(300)
+        inspector.setMaximumWidth(360)
+        side = QVBoxLayout(inspector)
+        side.setContentsMargins(16, 15, 16, 16)
+        side.setSpacing(10)
+        run_row = QHBoxLayout()
+        self.run = ActionButton(
+            "Run Inspection",
+            "fa6s.play",
+            primary=True,
+            tooltip="Read the Reduction quality metrics and prepare the interactive frame review.",
+        )
+        self.run.clicked.connect(self.runRequested)
+        self.cancel = ActionButton(
+            "Cancel",
+            "fa6s.stop",
+            tooltip="Stop the scan safely and keep the previous confirmed inspection.",
+        )
+        self.cancel.setEnabled(False)
+        self.cancel.clicked.connect(self.cancelRequested)
+        run_row.addWidget(self.run, 1)
+        run_row.addWidget(self.cancel)
+        side.addLayout(run_row)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        side.addWidget(self.progress)
+        self.summary = QLabel("Run Inspection to review the reduced frames.")
+        self.summary.setObjectName("muted")
+        self.summary.setWordWrap(True)
+        side.addWidget(self.summary)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        side.addWidget(divider)
+        review_actions = QHBoxLayout()
+        self.include_review = ActionButton(
+            "Include Review",
+            "fa6s.circle-check",
+            primary=True,
+            tooltip="Include every amber frame that Inspection suggested for review.",
+        )
+        self.include_review.setProperty("activeToggle", True)
+        self.include_review.clicked.connect(
+            lambda: self.set_suggestions_excluded(False)
+        )
+        self.exclude_review = ActionButton(
+            "Exclude Review",
+            "fa6s.circle-xmark",
+            tooltip="Exclude every amber frame that Inspection suggested for review.",
+        )
+        self.exclude_review.set_cancel_active(True)
+        self.exclude_review.clicked.connect(
+            lambda: self.set_suggestions_excluded(True)
+        )
+        review_actions.addWidget(self.include_review)
+        review_actions.addWidget(self.exclude_review)
+        side.addLayout(review_actions)
+        title = QLabel("Selected frame")
+        title.setObjectName("sectionTitle")
+        side.addWidget(title)
+        self.filename = QLabel("No frame selected")
+        self.filename.setWordWrap(True)
+        side.addWidget(self.filename)
+        self.details = QLabel("")
+        self.details.setObjectName("muted")
+        self.details.setWordWrap(True)
+        side.addWidget(self.details)
+        self.frame_status = QLabel("")
+        self.frame_status.setWordWrap(True)
+        side.addWidget(self.frame_status)
+
+        navigation = QHBoxLayout()
+        self.previous = ActionButton("Previous", "fa6s.arrow-left")
+        self.next = ActionButton("Next", "fa6s.arrow-right")
+        self.previous.clicked.connect(lambda: self.select_frame(self.selected_index - 1))
+        self.next.clicked.connect(lambda: self.select_frame(self.selected_index + 1))
+        navigation.addWidget(self.previous)
+        navigation.addWidget(self.next)
+        side.addLayout(navigation)
+        self.next_suggested = ActionButton(
+            "Next Suggested",
+            "fa6s.triangle-exclamation",
+            tooltip="Jump to the next included frame with unusual sky or PSF values.",
+        )
+        self.next_suggested.clicked.connect(self.select_next_suggested)
+        side.addWidget(self.next_suggested)
+
+        state_title = QLabel("Frame decision")
+        state_title.setObjectName("sectionTitle")
+        side.addWidget(state_title)
+        state = QHBoxLayout()
+        self.include = ActionButton("Include", "fa6s.circle-check")
+        self.exclude = ActionButton("Exclude", "fa6s.circle-xmark")
+        self.include.clicked.connect(lambda: self.set_excluded(False))
+        self.exclude.clicked.connect(lambda: self.set_excluded(True))
+        state.addWidget(self.include)
+        state.addWidget(self.exclude)
+        side.addLayout(state)
+        self.decision_help = QLabel(
+            "Amber points are suggestions only. They remain included until you exclude them."
+        )
+        self.decision_help.setObjectName("muted")
+        self.decision_help.setWordWrap(True)
+        side.addWidget(self.decision_help)
+        side.addStretch()
+        self.confirm = ActionButton(
+            "Confirm Inspection && Continue",
+            "fa6s.arrow-right",
+            primary=True,
+            tooltip="Save the accepted frame list and unlock Alignment.",
+        )
+        self.confirm.setEnabled(False)
+        self.confirm.clicked.connect(lambda: self.confirmRequested.emit(self.exclusions()))
+        side.addWidget(self.confirm)
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setMinimumWidth(300)
+        inspector_scroll.setMaximumWidth(380)
+        inspector_scroll.setWidget(inspector)
+        lower.addWidget(inspector_scroll)
+        layout.addLayout(lower, 3)
+        outer.addWidget(body, 1)
+        self._refresh_controls()
+
+    def set_result(self, result: Any, reduction_dir: Path) -> None:
+        selected_name = (
+            self.frames[self.selected_index].get("file")
+            if 0 <= self.selected_index < len(self.frames)
+            else None
+        )
+        self.frames = [dict(record) for record in result.frames]
+        self.reduction_dir = reduction_dir
+        self.sky_plot.set_frames(self.frames, result.time_axis)
+        self.psf_plot.set_frames(self.frames, result.time_axis)
+        self.run.set_idle_text("Run Inspection Again")
+        self.run.setEnabled(True)
+        self.progress.setValue(100)
+        selected = next(
+            (
+                index
+                for index, record in enumerate(self.frames)
+                if record.get("file") == selected_name
+            ),
+            0,
+        )
+        self.select_frame(selected)
+        self._refresh_summary()
+
+    def set_empty(self, message: str = "Run Inspection to review the reduced frames.") -> None:
+        self.frames = []
+        self.reduction_dir = None
+        self.selected_index = -1
+        self.run.set_idle_text("Run Inspection")
+        self.run.setEnabled(True)
+        self.progress.setValue(0)
+        self.summary.setText(message)
+        self.sky_plot.set_frames([], "elapsed_hours")
+        self.psf_plot.set_frames([], "elapsed_hours")
+        self.filename.setText("No frame selected")
+        self.details.clear()
+        self.frame_status.clear()
+        self._refresh_controls()
+
+    def set_mission_state(self, message: str) -> None:
+        self.set_empty(message)
+        self.run.setEnabled(False)
+        self.confirm.setEnabled(False)
+
+    def select_frame(self, index: int, *, load_image: bool = True) -> None:
+        if not self.frames:
+            return
+        self.selected_index = min(max(index, 0), len(self.frames) - 1)
+        self.sky_plot.set_selected(self.selected_index)
+        self.psf_plot.set_selected(self.selected_index)
+        record = self.frames[self.selected_index]
+        self.filename.setText(
+            f"Frame {record.get('index', self.selected_index + 1)} of {len(self.frames)}\n"
+            f"{record.get('file', '')}"
+        )
+        elapsed = float(record.get("elapsed_hours", self.selected_index))
+        jd = record.get("jd")
+        jd_text = f" · JD {float(jd):.7f}" if jd is not None else ""
+        try:
+            psf = float(record.get("psf", float("nan")))
+            psf_text = f"{psf:.4g}" if np.isfinite(psf) else "unavailable"
+        except (TypeError, ValueError):
+            psf_text = "unavailable"
+        self.details.setText(
+            f"Time: {elapsed:.3f} h{jd_text}\n"
+            f"Sky: {float(record.get('sky', 0.0)):.5g} counts/pixel\n"
+            f"PSF max. HWHM: {psf_text} px"
+        )
+        if record.get("hard_excluded"):
+            self.frame_status.setText(str(record.get("hard_exclusion_reason", "Frame unavailable")))
+            self.frame_status.setStyleSheet(f"color: {COLORS['red']};")
+        elif record.get("excluded"):
+            self.frame_status.setText("Excluded manually from Alignment and Photometry.")
+            self.frame_status.setStyleSheet(f"color: {COLORS['red']};")
+        elif record.get("suggest_exclude"):
+            self.frame_status.setText("Suggested for review · currently included.")
+            self.frame_status.setStyleSheet(f"color: {COLORS['amber']};")
+        else:
+            self.frame_status.setText("Included")
+            self.frame_status.setStyleSheet(f"color: {COLORS['green']};")
+        if self.reduction_dir and load_image:
+            path = self.reduction_dir / str(record.get("file", ""))
+            try:
+                self.workspace.load_fits(path)
+            except (OSError, ValueError) as exc:
+                self.frame_status.setText(f"This reduced FITS frame could not be displayed: {exc}")
+                self.frame_status.setStyleSheet(f"color: {COLORS['amber']};")
+        self._refresh_controls()
+
+    def set_excluded(self, excluded: bool) -> None:
+        if not 0 <= self.selected_index < len(self.frames):
+            return
+        record = self.frames[self.selected_index]
+        if record.get("hard_excluded"):
+            return
+        record["manual_excluded"] = bool(excluded)
+        record["excluded"] = bool(excluded)
+        self.sky_plot.update()
+        self.psf_plot.update()
+        self._refresh_summary()
+        self.select_frame(self.selected_index, load_image=False)
+        self.draftChanged.emit(self.exclusions())
+
+    def set_suggestions_excluded(self, excluded: bool) -> None:
+        changed = False
+        for record in self.frames:
+            if not record.get("suggest_exclude") or record.get("hard_excluded"):
+                continue
+            if bool(record.get("manual_excluded")) != excluded:
+                changed = True
+            record["manual_excluded"] = excluded
+            record["excluded"] = excluded
+        if not changed:
+            return
+        self.sky_plot.update()
+        self.psf_plot.update()
+        self._refresh_summary()
+        self.select_frame(self.selected_index, load_image=False)
+        self.draftChanged.emit(self.exclusions())
+
+    def select_next_suggested(self) -> None:
+        if not self.frames:
+            return
+        for offset in range(1, len(self.frames) + 1):
+            index = (self.selected_index + offset) % len(self.frames)
+            record = self.frames[index]
+            if record.get("suggest_exclude") and not record.get("excluded"):
+                self.select_frame(index)
+                return
+
+    def exclusions(self) -> dict[str, bool]:
+        return {
+            str(record.get("file")): bool(record.get("manual_excluded", False))
+            for record in self.frames
+        }
+
+    def set_busy(self, busy: bool) -> None:
+        self.run.set_running(busy, "Running Inspection…")
+        self.run.setEnabled(not busy)
+        self.cancel.set_cancel_active(busy)
+        self.cancel.setEnabled(busy)
+        self.confirm.setEnabled(not busy and self._included_count() >= 2)
+
+    def update_event(self, event: StageEvent) -> None:
+        self.summary.setText(event.message)
+        self.progress.setValue(round(event.fraction * 100))
+
+    def set_failure(self, failure: LEAPSError) -> None:
+        self.summary.setText(f"{failure.title}: {failure.message}")
+        self.summary.setStyleSheet(f"color: {COLORS['amber']};")
+
+    def set_cancelled(self) -> None:
+        self.summary.setText("Inspection cancelled safely · previous confirmed choices were kept.")
+        self.summary.setStyleSheet(f"color: {COLORS['muted']};")
+
+    def _included_count(self) -> int:
+        return sum(not bool(record.get("excluded")) for record in self.frames)
+
+    def _refresh_summary(self) -> None:
+        included = self._included_count()
+        excluded = len(self.frames) - included
+        suggested = sum(
+            bool(record.get("suggest_exclude")) and not bool(record.get("excluded"))
+            for record in self.frames
+        )
+        self.summary.setStyleSheet("")
+        self.summary.setText(
+            f"{len(self.frames)} frames · {included} included · {excluded} excluded · "
+            f"{suggested} suggested for review"
+        )
+        self.confirm.setEnabled(included >= 2 and not self.run.property("running"))
+
+    def _refresh_controls(self) -> None:
+        selected = 0 <= self.selected_index < len(self.frames)
+        record = self.frames[self.selected_index] if selected else {}
+        hard = bool(record.get("hard_excluded"))
+        excluded = bool(record.get("excluded"))
+        self.previous.setEnabled(selected and self.selected_index > 0)
+        self.next.setEnabled(selected and self.selected_index < len(self.frames) - 1)
+        self.next_suggested.setEnabled(
+            any(
+                item.get("suggest_exclude") and not item.get("excluded")
+                for item in self.frames
+            )
+        )
+        has_suggestions = any(
+            item.get("suggest_exclude") and not item.get("hard_excluded")
+            for item in self.frames
+        )
+        self.include_review.setEnabled(has_suggestions)
+        self.exclude_review.setEnabled(has_suggestions)
+        self.include.setEnabled(selected and not hard)
+        self.exclude.setEnabled(selected and not hard)
+        self.include.setProperty("activeToggle", selected and not excluded)
+        self.include.style().unpolish(self.include)
+        self.include.style().polish(self.include)
+        self.exclude.set_cancel_active(selected and excluded)
+        self.confirm.setEnabled(
+            bool(self.frames) and self._included_count() >= 2 and not self.run.property("running")
+        )
 
 
 class ProcessingPage(QWidget):
@@ -1757,6 +2326,10 @@ class FittingPage(QWidget):
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
         self._preview_path: Path | None = None
+        self._observatory_latitude: float | None = None
+        self._observatory_longitude: float | None = None
+        self._observatory_source = ""
+        self._exposure_source = ""
         self.planet = QComboBox()
         self.planet.setEditable(True)
         self.planet.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -1783,11 +2356,27 @@ class FittingPage(QWidget):
             self.filter.addItem(label, identifier)
         self.filter.setCurrentIndex(-1)
         self.filter.setPlaceholderText("Detecting from science FITS…")
+        self.exposure_time = QDoubleSpinBox()
+        self.exposure_time.setDecimals(3)
+        self.exposure_time.setRange(0, 86_400)
+        self.exposure_time.setSuffix(" s")
+        self.exposure_time.setSpecialValueText("Enter exposure time")
+        self.exposure_time.setToolTip(
+            "Exposure duration for one science frame. The FITS value is used by "
+            "default; enter a positive value here when it is missing or incorrect."
+        )
         self.detrending = QComboBox()
         self.detrending.addItem("Airmass", "airmass")
         self.detrending.addItem("Quadratic", "quadratic")
         self.detrending.addItem("Linear", "linear")
         self.detrending.setCurrentIndex(self.detrending.findData("quadratic"))
+        self.observatory = QLineEdit()
+        self.observatory.setReadOnly(True)
+        self.observatory.setPlaceholderText("Not found in science FITS")
+        self.observatory.setToolTip(
+            "Observatory name and coordinates detected from the science FITS headers. "
+            "These coordinates are used when Airmass de-trending is selected."
+        )
         form.addRow(
             LabelWithInfo(
                 "Planet",
@@ -1797,11 +2386,19 @@ class FittingPage(QWidget):
         )
         form.addRow(LabelWithInfo("Period (days)", "Time between consecutive transits."), self.period)
         form.addRow(
-            LabelWithInfo("Mid-transit (BJD)", "Expected center of the transit in barycentric Julian date."),
+            LabelWithInfo(
+                "Mid-transit (BJD)",
+                "Expected transit center. Enter a full BJD, BJD minus 2450000 "
+                "(for example 9065.5097), or only the decimal-day fraction (0.5097).",
+            ),
             self.mid_time,
         )
         form.addRow(
-            LabelWithInfo("Expected depth", "Approximate fractional loss of light during transit."),
+            LabelWithInfo(
+                "Expected depth (fraction)",
+                "Approximate fractional loss of light: 0.01 means 1%. A value of "
+                "0.33 ppt from a transit table is 0.00033 here.",
+            ),
             self.depth,
         )
         form.addRow(
@@ -1813,10 +2410,25 @@ class FittingPage(QWidget):
         )
         form.addRow(
             LabelWithInfo(
+                "Exposure time (seconds)",
+                "Duration of one science exposure. A manually entered value is saved "
+                "with this fitting setup and does not modify the FITS files.",
+            ),
+            self.exposure_time,
+        )
+        form.addRow(
+            LabelWithInfo(
                 "De-trending",
                 "Remove a trend using airmass, a quadratic time curve, or a linear time curve. Quadratic is the default.",
             ),
             self.detrending,
+        )
+        form.addRow(
+            LabelWithInfo(
+                "Observatory",
+                "Detected from the science FITS headers and used for Airmass de-trending and timing corrections.",
+            ),
+            self.observatory,
         )
         form_layout.addLayout(form)
 
@@ -2063,6 +2675,7 @@ class FittingPage(QWidget):
                 control.currentTextChanged.connect(self.invalidate_preview)
             else:
                 control.valueChanged.connect(self.invalidate_preview)
+        self.exposure_time.valueChanged.connect(self._exposure_time_changed)
         self.planet.activated.connect(self._planet_activated)
         self.reset_setup("Loading the selected target and science-frame metadata…")
 
@@ -2084,8 +2697,14 @@ class FittingPage(QWidget):
             "metallicity": self.metallicity.value(),
             "filter": self.filter.currentData()
             or normalize_filter(self.filter.currentText()),
+            "exposure_time": self.exposure_time.value(),
+            "exposure_time_source": self._exposure_source,
             "light_curve": self.light_curve.currentData(),
             "detrending": self.detrending.currentData(),
+            "observatory": self.observatory.text(),
+            "observatory_latitude": self._observatory_latitude,
+            "observatory_longitude": self._observatory_longitude,
+            "observatory_source": self._observatory_source,
             "iterations": self.iterations.value(),
             "burn": self.burn.value(),
         }
@@ -2140,7 +2759,16 @@ class FittingPage(QWidget):
         self.filter.blockSignals(True)
         self.filter.setCurrentIndex(-1)
         self.filter.blockSignals(False)
+        self.exposure_time.blockSignals(True)
+        self.exposure_time.setReadOnly(False)
+        self.exposure_time.setValue(0)
+        self.exposure_time.blockSignals(False)
+        self._exposure_source = ""
         self.observation_source.setText("Science-frame metadata has not been loaded.")
+        self._observatory_latitude = None
+        self._observatory_longitude = None
+        self._observatory_source = ""
+        self.observatory.clear()
         self.preview_image.clear()
         self.preview_image.setVisible(False)
         self.view_in_files.setEnabled(False)
@@ -2233,6 +2861,7 @@ class FittingPage(QWidget):
         exposure_time: float | None,
         *,
         filter_status: str = "detected",
+        exposure_source: str = "science FITS",
     ) -> None:
         canonical = normalize_filter(filter_name) if filter_name else None
         self.filter.blockSignals(True)
@@ -2241,9 +2870,28 @@ class FittingPage(QWidget):
         if canonical and index < 0:
             self.filter.setEditText(canonical)
         self.filter.blockSignals(False)
-        exposure = f"{exposure_time:g} s exposures" if exposure_time else "exposure time unavailable"
+        exposure_value = _optional_float(exposure_time)
+        if exposure_value is None or exposure_value <= 0:
+            exposure_value = 0.0
+            exposure_source = ""
+        self.exposure_time.blockSignals(True)
+        self.exposure_time.setValue(exposure_value)
+        self.exposure_time.setReadOnly(filter_status == "tess")
+        self.exposure_time.blockSignals(False)
+        self._exposure_source = exposure_source
+        exposure = (
+            f"{exposure_value:g} s exposures"
+            if exposure_value > 0
+            else "exposure time unavailable; enter it above"
+        )
+        if exposure_value > 0 and exposure_source == "manual override":
+            exposure += " · manual fitting override"
         if filter_status == "tess":
-            tess_cadence = f"{exposure_time:g} s cadence" if exposure_time else "cadence unavailable"
+            tess_cadence = (
+                f"{exposure_value:g} s cadence"
+                if exposure_value > 0
+                else "cadence unavailable"
+            )
             self.observation_source.setText(
                 f"TESS band · {tess_cadence} · imported calibrated PDCSAP light curve"
             )
@@ -2259,6 +2907,40 @@ class FittingPage(QWidget):
             self.observation_source.setText(
                 f"No recognized FITS filter was found · {exposure}. Choose the passband used for the observation."
             )
+        self.invalidate_preview()
+
+    def _exposure_time_changed(self, *_args: Any) -> None:
+        self._exposure_source = "manual override"
+        self.invalidate_preview()
+
+    def set_observatory_metadata(
+        self,
+        name: str,
+        latitude: float | None,
+        longitude: float | None,
+        *,
+        source: str,
+    ) -> None:
+        self._observatory_latitude = _optional_float(latitude)
+        self._observatory_longitude = _optional_float(longitude)
+        self._observatory_source = source
+        label = name.strip() or "Unnamed observatory"
+        if source == "mission metadata":
+            self.observatory.setText(f"{label} · space-based · {source}")
+            self.observatory.setStyleSheet(f"color: {COLORS['muted']};")
+        elif self._observatory_latitude is not None and self._observatory_longitude is not None:
+            self.observatory.setText(
+                f"{label} · {self._observatory_latitude:+.5f}°, "
+                f"{self._observatory_longitude:+.5f}° · {source}"
+            )
+            self.observatory.setStyleSheet(f"color: {COLORS['muted']};")
+        elif name.strip():
+            self.observatory.setText(f"{label} · coordinates unavailable · {source}")
+            self.observatory.setStyleSheet(f"color: {COLORS['amber']};")
+        else:
+            self.observatory.clear()
+            self.observatory.setPlaceholderText("Not found in science FITS or Settings")
+            self.observatory.setStyleSheet(f"color: {COLORS['amber']};")
         self.invalidate_preview()
 
     def set_busy(self, busy: bool, *, full: bool = False) -> None:
@@ -2353,6 +3035,7 @@ class FittingPage(QWidget):
             self.period.value() > 0
             and self.mid_time.value() > 0
             and 0 < self.depth.value() <= 1
+            and self.exposure_time.value() > 0
             and self.sma_over_rs.value() > 0
             and 0 < self.inclination.value() <= 90
             and 0 <= self.eccentricity.value() < 1

@@ -12,11 +12,12 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from leaps.models import JobStatus, LEAPSError
+from leaps.models import JobStatus, LEAPSError, StageID, StageStatus
 from leaps.project import ProjectWorkspace
 from leaps.science import (
     AlignmentService,
     CancellationToken,
+    InspectionService,
     PhotometryConfig,
     PhotometryService,
     PlateSolveService,
@@ -43,7 +44,35 @@ def _alignment_project(root: Path, frame_count: int = 8) -> ProjectWorkspace:
             np.full((32, 32), 100.0 + index, dtype=np.float32),
             header,
         )
+    inspection = InspectionService().run(project)
+    InspectionService.confirm(
+        project,
+        {record["file"]: False for record in inspection.frames},
+    )
+    project.set_stage(StageID.INSPECTION, StageStatus.COMPLETE, "Confirmed")
     return project
+
+
+def _write_fits_with_unquoted_coordinates(path: Path) -> None:
+    header = fits.Header(
+        {
+            "EXPTIME": 30.0,
+            "DATE-OBS": "2024-11-16T02:56:06.609101",
+            "RA": "23 54 40.53",
+            "DEC": "-37 37 41.61",
+        }
+    )
+    fits.writeto(path, np.arange(256, dtype=np.float32).reshape(16, 16), header)
+    contents = bytearray(path.read_bytes())
+    for keyword, value, comment in (
+        ("RA", "23 54 40.53", "Right Ascension"),
+        ("DEC", "-37 37 41.61", "Declination"),
+    ):
+        marker = f"{keyword:<8}=".encode("ascii")
+        offset = contents.index(marker)
+        replacement = f"{keyword:<8}= {value:<20} / {comment}".ljust(80)
+        contents[offset : offset + 80] = replacement.encode("ascii")
+    path.write_bytes(contents)
 
 
 def _alignment_stars(index: int) -> list[list[float]]:
@@ -88,6 +117,31 @@ def test_reduction_keeps_raw_fits_immutable_and_commits_output(tmp_path: Path, m
     assert hashlib.sha256(raw.read_bytes()).hexdigest() == before
     assert len(list(output.glob("r_*.fits"))) == 1
     assert (output / "frames.json").exists()
+
+
+def test_reduction_normalizes_unquoted_coordinate_cards_only_in_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    raw = tmp_path / "LTT-9779_001.fits"
+    _write_fits_with_unquoted_coordinates(raw)
+    before = hashlib.sha256(raw.read_bytes()).hexdigest()
+    project = ProjectWorkspace.create(tmp_path)
+    project.manifest.raw_files["science"] = [raw.name]
+    project.save()
+    monkeypatch.setattr(
+        ReductionService,
+        "_statistics",
+        staticmethod(lambda data, header: (100.0, 5.0, 2.5)),
+    )
+
+    output = ReductionService().run(project, ReductionConfig())
+
+    reduced = next(output.glob("r_*.fits"))
+    with fits.open(reduced) as hdus:
+        hdus[0].verify("exception")
+        assert hdus[0].header["RA"] == "23 54 40.53"
+        assert hdus[0].header["DEC"] == "-37 37 41.61"
+    assert hashlib.sha256(raw.read_bytes()).hexdigest() == before
 
 
 def test_reduction_reads_unsigned_scaled_fits_without_changing_raw_files(
@@ -158,6 +212,100 @@ def test_cancellation_is_typed_and_recoverable() -> None:
         assert "Resume" in failure.recovery
     else:
         raise AssertionError("cancelled token did not raise")
+
+
+def test_inspection_keeps_suggestions_included_and_persists_manual_draft(
+    tmp_path: Path,
+) -> None:
+    project = ProjectWorkspace.create(tmp_path)
+    reduction = project.outputs_dir / "reduction"
+    reduction.mkdir()
+    skies = [100.0, 100.1, 99.9, 100.0, 160.0, 100.0]
+    for index, sky in enumerate(skies):
+        header = fits.Header(
+            {
+                "HOPSJD": 2460000.0 + index / 1440,
+                "HOPSMEAN": sky,
+                "HOPSSTD": 5.0,
+                "HOPSPSF": 2.0,
+                "HOPSSKIP": index == 5,
+            }
+        )
+        fits.writeto(
+            reduction / f"r_{index:05d}.fits",
+            np.full((16, 16), sky, dtype=np.float32),
+            header,
+        )
+
+    result = InspectionService().run(project)
+
+    assert result.time_axis == "elapsed_hours"
+    assert result.frames[4]["suggest_exclude"] is True
+    assert result.frames[4]["excluded"] is False
+    assert result.frames[5]["hard_excluded"] is True
+    assert result.frames[5]["excluded"] is True
+    InspectionService.save_draft(project, {"r_00002.fits": True})
+    restored = InspectionService.load(project)
+    assert restored is not None
+    assert restored.frames[2]["manual_excluded"] is True
+
+    rescanned = InspectionService().run(project)
+    assert rescanned.frames[2]["manual_excluded"] is True
+    confirmed = InspectionService.confirm(project, {"r_00002.fits": True})
+    project.set_stage(StageID.INSPECTION, StageStatus.COMPLETE, "Confirmed")
+    assert confirmed.confirmed is True
+    assert confirmed.included_count == 4
+    assert [path.name for path in InspectionService.confirmed_frames(project)] == [
+        "r_00000.fits",
+        "r_00001.fits",
+        "r_00003.fits",
+        "r_00004.fits",
+    ]
+
+    changed_path = reduction / "r_00002.fits"
+    fits.setval(changed_path, "HOPSMEAN", value=102.0)
+    changed = InspectionService().run(project)
+    assert changed.reduction_fingerprint != confirmed.reduction_fingerprint
+    assert changed.confirmed is False
+    assert changed.frames[2]["manual_excluded"] is False
+
+
+def test_alignment_uses_only_confirmed_included_frames(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hops.hops_tools.image_analysis as image_analysis
+    from hops.thirdparty import twirl
+
+    project = _alignment_project(tmp_path, frame_count=6)
+    InspectionService.confirm(
+        project,
+        {
+            "r_00000.fits": True,
+            "r_00002.fits": True,
+            "r_00005.fits": True,
+        },
+    )
+
+    monkeypatch.setattr(
+        image_analysis,
+        "image_find_stars",
+        lambda _data, header, **_kwargs: _alignment_stars(int(header["FRAMEIDX"])),
+    )
+    monkeypatch.setattr(twirl.utils, "find_transform", _alignment_transform)
+
+    output = AlignmentService().run(project)
+    records = json.loads((output / "alignment.json").read_text(encoding="utf-8"))
+
+    assert [record["file"] for record in records] == [
+        "r_00001.fits",
+        "r_00003.fits",
+        "r_00004.fits",
+    ]
+    assert [path.name for path in AlignmentService.successful_frames(project)] == [
+        "r_00001.fits",
+        "r_00003.fits",
+        "r_00004.fits",
+    ]
 
 
 def test_alignment_worker_count_balances_cpu_frame_size_and_short_runs(monkeypatch) -> None:
@@ -335,7 +483,7 @@ def test_hops_photometry_writes_aperture_gaussian_and_legacy_outputs(
     project = ProjectWorkspace.create(tmp_path)
     reduction = project.outputs_dir / "reduction"
     reduction.mkdir()
-    for index in range(2):
+    for index in range(3):
         header = fits.Header(
             {
                 "HOPSJD": 2460000.0 + index / 100,
@@ -391,6 +539,7 @@ def test_hops_photometry_writes_aperture_gaussian_and_legacy_outputs(
         "RESULTS.png",
     } <= names
     curve = np.loadtxt(output)
+    assert curve.shape[0] == 2
     assert np.allclose(curve[:, 1], 1.0)
 
 

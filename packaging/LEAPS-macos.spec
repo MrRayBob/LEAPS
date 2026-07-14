@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Dependency-complete PyInstaller bundle for Apple Silicon releases."""
 
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 ROOT = Path(SPECPATH).parent
+VERSION = os.environ.get("LEAPS_VERSION", "2.0.0").removeprefix("v")
 datas = [
     (str(ROOT / "leaps" / "assets"), "leaps/assets"),
     (str(ROOT / "leaps" / "assets"), "assets"),
@@ -76,8 +78,8 @@ application = BUNDLE(
     info_plist={
         "CFBundleDisplayName": "LEAPS",
         "CFBundleName": "LEAPS",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSDocumentsFolderUsageDescription": "LEAPS needs access to your observing-run folder to read FITS images and save project results beside them.",
         "NSDesktopFolderUsageDescription": "LEAPS needs access when an observing run is stored on your Desktop.",
         "NSDownloadsFolderUsageDescription": "LEAPS needs access when an observing run is stored in Downloads.",

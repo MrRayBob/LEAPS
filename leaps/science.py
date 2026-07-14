@@ -17,11 +17,39 @@ import numpy as np
 
 from .catalog import PlanetParameters
 from .filters import normalize_filter, passband_label
-from .fits_inventory import observing_run_access_failure
-from .models import JobStatus, LEAPSError, StageEvent, StageID
+from .fits_inventory import normalized_fits_header, observing_run_access_failure
+from .models import JobStatus, LEAPSError, StageEvent, StageID, StageStatus
 from .project import ProjectWorkspace
 
 Emitter = Callable[[StageEvent], None]
+
+
+def _normalize_mid_transit_time(value: object, observation_times: Any) -> float:
+    """Expand common shortened BJD forms around the current observation.
+
+    Transit tables commonly publish BJD - 2450000, while observers sometimes
+    enter only the fractional day. Full Julian dates are left untouched.
+    """
+    mid_time = float(value)
+    if not math.isfinite(mid_time) or mid_time <= 0:
+        return mid_time
+    times = np.asarray(observation_times, dtype=float)
+    finite_times = times[np.isfinite(times)]
+    if not finite_times.size or mid_time >= 1_000_000:
+        return mid_time
+    observation_center = float(np.median(finite_times))
+    if mid_time < 1:
+        observation_day = math.floor(observation_center)
+        candidates = [
+            observation_day + day_offset + mid_time
+            for day_offset in (-1, 0, 1)
+        ]
+    else:
+        candidates = [
+            mid_time + offset
+            for offset in (2_400_000.0, 2_400_000.5, 2_450_000.0)
+        ]
+    return min(candidates, key=lambda candidate: abs(candidate - observation_center))
 
 
 def _read_fits_image(path: Path) -> tuple[np.ndarray, Any]:
@@ -50,7 +78,7 @@ def _read_fits_image(path: Path) -> tuple[np.ndarray, Any]:
             hdu = next(candidate for candidate in hdus if getattr(candidate, "data", None) is not None)
             stored = np.asarray(hdu.data)
             data = stored.astype(np.float32, copy=True)
-            header = hdu.header.copy()
+            header = normalized_fits_header(hdu.header)
 
     blank = header.get("BLANK")
     if blank is not None:
@@ -135,6 +163,12 @@ class InspectionResult:
     frames: list[dict[str, Any]]
     median_sky: float
     median_psf: float
+    reduction_fingerprint: str = ""
+    included_count: int = 0
+    excluded_count: int = 0
+    suggested_count: int = 0
+    confirmed: bool = False
+    time_axis: str = "elapsed_hours"
 
 
 @dataclass(slots=True)
@@ -377,6 +411,8 @@ class ReductionService:
 
 
 class InspectionService:
+    DRAFT_FILENAME = "inspection-draft.json"
+
     def run(
         self,
         project: ProjectWorkspace,
@@ -396,35 +432,368 @@ class InspectionService:
             )
         from astropy.io import fits
 
+        previous = self.load(project, include_draft=False, required=False)
+
         values: list[dict[str, Any]] = []
         for index, path in enumerate(frames, start=1):
             token.raise_if_cancelled()
             header = fits.getheader(path)
+            source_stat = path.stat()
+            psf = self._finite_float(header.get("HOPSPSF"))
+            hard_excluded = bool(header.get("HOPSSKIP", False)) or psf is None or psf <= 0
             values.append(
                 {
                     "file": path.name,
-                    "sky": float(header.get("HOPSMEAN", 0.0)),
-                    "sky_std": float(header.get("HOPSSTD", 0.0)),
-                    "psf": float(header.get("HOPSPSF", float("nan"))),
-                    "excluded": bool(header.get("HOPSSKIP", False)),
+                    "index": index,
+                    "source_size": source_stat.st_size,
+                    "source_mtime_ns": source_stat.st_mtime_ns,
+                    "jd": self._finite_float(header.get("HOPSJD")),
+                    "elapsed_hours": float(index - 1),
+                    "sky": self._finite_float(header.get("HOPSMEAN")) or 0.0,
+                    "sky_std": self._finite_float(header.get("HOPSSTD")) or 0.0,
+                    "psf": psf if psf is not None else float("nan"),
+                    "hard_excluded": hard_excluded,
+                    "hard_exclusion_reason": (
+                        "Reduction could not measure a valid PSF for this frame."
+                        if hard_excluded
+                        else ""
+                    ),
+                    "manual_excluded": False,
+                    "excluded": hard_excluded,
                 }
             )
             _emit(emit, StageID.INSPECTION, JobStatus.RUNNING, f"Checked {path.name}", index, len(frames))
+        time_axis = "elapsed_hours"
+        finite_jds = [record["jd"] for record in values if record["jd"] is not None]
+        if len(finite_jds) == len(values):
+            first_jd = float(finite_jds[0])
+            for record in values:
+                record["elapsed_hours"] = (float(record["jd"]) - first_jd) * 24.0
+        else:
+            time_axis = "frame_index"
+
+        fingerprint = self._fingerprint(values)
+        previous_by_name: dict[str, dict[str, Any]] = {}
+        same_inputs = False
+        if previous:
+            previous_by_name = {str(record.get("file")): record for record in previous.frames}
+            same_inputs = previous.reduction_fingerprint == fingerprint or (
+                not previous.reduction_fingerprint
+                and set(previous_by_name) == {record["file"] for record in values}
+            )
+        draft = self._load_draft(project, fingerprint)
+        for record in values:
+            old = previous_by_name.get(record["file"], {}) if same_inputs else {}
+            manually_excluded = bool(
+                draft.get(record["file"], old.get("manual_excluded", False))
+            )
+            if "manual_excluded" not in old and old.get("excluded") and not old.get(
+                "hard_excluded", False
+            ):
+                manually_excluded = bool(draft.get(record["file"], True))
+            record["manual_excluded"] = manually_excluded and not record["hard_excluded"]
+            record["excluded"] = bool(record["hard_excluded"] or record["manual_excluded"])
+
         skies = np.array([record["sky"] for record in values], dtype=float)
         psfs = np.array([record["psf"] for record in values], dtype=float)
         sky_median, psf_median = float(np.nanmedian(skies)), float(np.nanmedian(psfs))
         sky_mad = max(float(np.nanmedian(np.abs(skies - sky_median))), 1e-9)
         psf_mad = max(float(np.nanmedian(np.abs(psfs - psf_median))), 1e-9)
         for record in values:
-            if abs(record["sky"] - sky_median) > 5 * sky_mad or abs(record["psf"] - psf_median) > 5 * psf_mad:
-                record["suggest_exclude"] = True
-            else:
-                record["suggest_exclude"] = False
+            record["suggest_exclude"] = bool(
+                not record["hard_excluded"]
+                and (
+                    abs(record["sky"] - sky_median) > 5 * sky_mad
+                    or abs(record["psf"] - psf_median) > 5 * psf_mad
+                )
+            )
         pending, target = project.begin_transaction(StageID.INSPECTION)
-        result = InspectionResult(values, sky_median, psf_median)
+        result = self._with_counts(
+            InspectionResult(
+                values,
+                sky_median,
+                psf_median,
+                reduction_fingerprint=fingerprint,
+                confirmed=bool(previous and previous.confirmed and same_inputs),
+                time_axis=time_axis,
+            )
+        )
         (pending / "inspection.json").write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
         project.commit_transaction(pending, target)
-        _emit(emit, StageID.INSPECTION, JobStatus.SUCCEEDED, "Inspection complete", len(frames), len(frames))
+        _emit(emit, StageID.INSPECTION, JobStatus.SUCCEEDED, "Inspection ready for review", len(frames), len(frames))
+        return result
+
+    @classmethod
+    def load(
+        cls,
+        project: ProjectWorkspace,
+        *,
+        include_draft: bool = True,
+        required: bool = True,
+    ) -> InspectionResult | None:
+        path = project.outputs_dir / StageID.INSPECTION.value / "inspection.json"
+        if not path.exists():
+            if not required:
+                return None
+            raise LEAPSError(
+                "INSPECTION_REQUIRED",
+                "Frame inspection has not been confirmed",
+                "Run Inspection and confirm the frames before Alignment.",
+                ["Open Inspection", "Run Inspection"],
+                stage=StageID.INSPECTION,
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            frames = [dict(record) for record in payload["frames"]]
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LEAPSError(
+                "INSPECTION_RESULT_INVALID",
+                "The saved frame inspection could not be read",
+                "Run Inspection again before Alignment.",
+                ["Open Inspection", "Run Inspection Again"],
+                stage=StageID.INSPECTION,
+                technical_details=str(exc),
+            ) from exc
+        reduction = project.outputs_dir / StageID.REDUCTION.value
+        legacy_records = any(
+            "hard_excluded" not in record or "jd" not in record for record in frames
+        )
+        if legacy_records:
+            try:
+                from astropy.io import fits
+            except ImportError:
+                fits = None
+        else:
+            fits = None
+        for index, record in enumerate(frames, start=1):
+            legacy_header: Any = {}
+            reduced_path = reduction / str(record.get("file", ""))
+            if fits is not None:
+                try:
+                    legacy_header = fits.getheader(reduced_path)
+                except (OSError, ValueError):
+                    legacy_header = {}
+            try:
+                source_stat = reduced_path.stat()
+            except OSError:
+                source_stat = None
+            record.setdefault("index", index)
+            record.setdefault(
+                "source_size", source_stat.st_size if source_stat is not None else None
+            )
+            record.setdefault(
+                "source_mtime_ns",
+                source_stat.st_mtime_ns if source_stat is not None else None,
+            )
+            record.setdefault("jd", cls._finite_float(legacy_header.get("HOPSJD")))
+            record.setdefault("elapsed_hours", float(index - 1))
+            psf = cls._finite_float(record.get("psf"))
+            hard_excluded = bool(
+                record.get(
+                    "hard_excluded",
+                    bool(legacy_header.get("HOPSSKIP", False))
+                    or psf is None
+                    or psf <= 0,
+                )
+            )
+            record.setdefault("hard_excluded", hard_excluded)
+            record.setdefault(
+                "hard_exclusion_reason",
+                "Reduction could not measure a valid PSF for this frame."
+                if hard_excluded
+                else "",
+            )
+            record.setdefault("manual_excluded", bool(record.get("excluded", False)) and not hard_excluded)
+            record.setdefault("suggest_exclude", False)
+            record["excluded"] = bool(
+                record["hard_excluded"] or record["manual_excluded"]
+            )
+        time_axis = str(payload.get("time_axis", ""))
+        if not time_axis:
+            finite_jds = [record["jd"] for record in frames if record["jd"] is not None]
+            if len(finite_jds) == len(frames):
+                first_jd = float(finite_jds[0])
+                for record in frames:
+                    record["elapsed_hours"] = (float(record["jd"]) - first_jd) * 24.0
+                time_axis = "elapsed_hours"
+            else:
+                time_axis = "frame_index"
+        reduction_fingerprint = str(payload.get("reduction_fingerprint", ""))
+        if not reduction_fingerprint and frames:
+            reduction_fingerprint = cls._fingerprint(frames)
+        result = InspectionResult(
+            frames=frames,
+            median_sky=float(payload.get("median_sky", 0.0)),
+            median_psf=float(payload.get("median_psf", 0.0)),
+            reduction_fingerprint=reduction_fingerprint,
+            included_count=int(payload.get("included_count", 0)),
+            excluded_count=int(payload.get("excluded_count", 0)),
+            suggested_count=int(payload.get("suggested_count", 0)),
+            confirmed=bool(
+                payload.get("confirmed", False)
+                or project.manifest.stages[StageID.INSPECTION.value].status
+                == StageStatus.COMPLETE
+            ),
+            time_axis=time_axis,
+        )
+        if include_draft:
+            draft = cls._load_draft(project, result.reduction_fingerprint)
+            for record in result.frames:
+                if record["file"] in draft and not record["hard_excluded"]:
+                    record["manual_excluded"] = bool(draft[record["file"]])
+                    record["excluded"] = bool(record["manual_excluded"])
+        return cls._with_counts(result)
+
+    @classmethod
+    def save_draft(cls, project: ProjectWorkspace, exclusions: dict[str, bool]) -> None:
+        result = cls.load(project, include_draft=False)
+        assert result is not None
+        known = {str(record["file"]) for record in result.frames}
+        decisions = {
+            name: bool(excluded)
+            for name, excluded in exclusions.items()
+            if name in known
+        }
+        payload = {
+            "reduction_fingerprint": result.reduction_fingerprint,
+            "manual_exclusions": decisions,
+        }
+        path = project.checkpoints_dir / cls.DRAFT_FILENAME
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+
+    @classmethod
+    def confirm(
+        cls,
+        project: ProjectWorkspace,
+        exclusions: dict[str, bool],
+    ) -> InspectionResult:
+        result = cls.load(project, include_draft=False)
+        assert result is not None
+        for record in result.frames:
+            manual = bool(exclusions.get(str(record["file"]), record["manual_excluded"]))
+            record["manual_excluded"] = manual and not record["hard_excluded"]
+            record["excluded"] = bool(record["hard_excluded"] or record["manual_excluded"])
+        result.confirmed = True
+        result = cls._with_counts(result)
+        if result.included_count < 2:
+            raise LEAPSError(
+                "INSPECTION_TOO_FEW_FRAMES",
+                "Keep at least two frames included",
+                "Alignment needs two or more accepted reduced frames.",
+                ["Include another frame"],
+                stage=StageID.INSPECTION,
+            )
+        pending, target = project.begin_transaction(StageID.INSPECTION)
+        try:
+            (pending / "inspection.json").write_text(
+                json.dumps(asdict(result), indent=2), encoding="utf-8"
+            )
+            project.commit_transaction(pending, target)
+        except BaseException:
+            project.discard_pending_transaction(StageID.INSPECTION)
+            raise
+        draft = project.checkpoints_dir / cls.DRAFT_FILENAME
+        if draft.exists():
+            draft.unlink()
+        return result
+
+    @classmethod
+    def confirmed_frames(cls, project: ProjectWorkspace) -> list[Path]:
+        result = cls.load(project, include_draft=False)
+        assert result is not None
+        if (
+            not result.confirmed
+            or project.manifest.stages[StageID.INSPECTION.value].status
+            != StageStatus.COMPLETE
+        ):
+            raise LEAPSError(
+                "INSPECTION_CONFIRMATION_REQUIRED",
+                "Confirm the frame inspection first",
+                "The current frame choices have not been approved for Alignment.",
+                ["Open Inspection", "Confirm Inspection"],
+                stage=StageID.INSPECTION,
+            )
+        reduction = project.outputs_dir / StageID.REDUCTION.value
+        available = {path.name: path for path in sorted(reduction.glob("*.fit*"))}
+        inspected_names = [str(record["file"]) for record in result.frames]
+        if set(inspected_names) != set(available):
+            raise LEAPSError(
+                "INSPECTION_STALE",
+                "The confirmed inspection no longer matches Reduction",
+                "The reduced frame set changed after Inspection was confirmed.",
+                ["Open Inspection", "Run Inspection Again"],
+                stage=StageID.INSPECTION,
+            )
+        selected = [
+            available[str(record["file"])]
+            for record in result.frames
+            if not record["excluded"]
+        ]
+        if len(selected) < 2:
+            raise LEAPSError(
+                "ALIGNMENT_INPUT_MISSING",
+                "Alignment needs at least two included frames",
+                "Return to Inspection and include another usable frame.",
+                ["Open Inspection"],
+                stage=StageID.ALIGNMENT,
+            )
+        return selected
+
+    @staticmethod
+    def _finite_float(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _fingerprint(records: list[dict[str, Any]]) -> str:
+        def finite(value: object) -> float | None:
+            number = InspectionService._finite_float(value)
+            return number if number is not None else None
+
+        payload = [
+            (
+                record["file"],
+                record.get("source_size"),
+                record.get("source_mtime_ns"),
+                finite(record.get("jd")),
+                finite(record.get("sky")),
+                finite(record.get("sky_std")),
+                finite(record.get("psf")),
+                bool(record.get("hard_excluded", False)),
+            )
+            for record in records
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _load_draft(cls, project: ProjectWorkspace, fingerprint: str) -> dict[str, bool]:
+        path = project.checkpoints_dir / cls.DRAFT_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if str(payload.get("reduction_fingerprint", "")) != fingerprint:
+                return {}
+            return {
+                str(name): bool(value)
+                for name, value in dict(payload.get("manual_exclusions", {})).items()
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _with_counts(result: InspectionResult) -> InspectionResult:
+        result.included_count = sum(not bool(record.get("excluded")) for record in result.frames)
+        result.excluded_count = len(result.frames) - result.included_count
+        result.suggested_count = sum(
+            bool(record.get("suggest_exclude")) and not bool(record.get("excluded"))
+            for record in result.frames
+        )
         return result
 
 
@@ -443,15 +812,7 @@ class AlignmentService:
 
         from hops.hops_tools.image_analysis import image_find_stars
 
-        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
-        if len(frames) < 2:
-            raise LEAPSError(
-                "ALIGNMENT_INPUT_MISSING",
-                "Alignment needs at least two reduced frames",
-                "Run Reduction first.",
-                ["Open Reduction"],
-                stage=StageID.ALIGNMENT,
-            )
+        frames = InspectionService.confirmed_frames(project)
         reference_data, reference_header = fits.getdata(frames[0], header=True)
         reference_nbytes = int(reference_data.nbytes)
         detected_reference = image_find_stars(
@@ -511,6 +872,39 @@ class AlignmentService:
         project.commit_transaction(pending, target)
         _emit(emit, StageID.ALIGNMENT, JobStatus.SUCCEEDED, "Alignment complete", len(frames), len(frames))
         return target
+
+    @staticmethod
+    def successful_frames(project: ProjectWorkspace) -> list[Path]:
+        alignment_path = project.outputs_dir / StageID.ALIGNMENT.value / "alignment.json"
+        try:
+            records = json.loads(alignment_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LEAPSError(
+                "PHOTOMETRY_ALIGNMENT_MISSING",
+                "No completed Alignment result is available",
+                "Run Alignment after confirming Inspection.",
+                ["Open Alignment"],
+                stage=StageID.PHOTOMETRY,
+                technical_details=str(exc),
+            ) from exc
+        reduced = {
+            path.name: path
+            for path in (project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*")
+        }
+        frames = [
+            reduced[str(record.get("file"))]
+            for record in records
+            if not record.get("failed") and str(record.get("file")) in reduced
+        ]
+        if not frames:
+            raise LEAPSError(
+                "PHOTOMETRY_ALIGNMENT_MISSING",
+                "No successfully aligned frames are available",
+                "Review Alignment diagnostics and rerun that stage.",
+                ["Open Alignment", "Review diagnostics"],
+                stage=StageID.PHOTOMETRY,
+            )
+        return frames
 
     @classmethod
     def _worker_count(cls, frame_count: int, frame_nbytes: int) -> int:
@@ -1192,15 +1586,7 @@ class PhotometryService:
         config: PhotometryConfig | None = None,
     ) -> Path:
         token = token or CancellationToken()
-        frames = sorted((project.outputs_dir / StageID.REDUCTION.value).glob("*.fit*"))
-        if not frames:
-            raise LEAPSError(
-                "PHOTOMETRY_INPUT_MISSING",
-                "No reduced frames are available",
-                "Run Reduction before starting photometry.",
-                ["Open Reduction"],
-                stage=StageID.PHOTOMETRY,
-            )
+        frames = AlignmentService.successful_frames(project)
         positions = [target_xy, *comparisons]
         if len(positions) < 2:
             raise LEAPSError(
@@ -1213,23 +1599,7 @@ class PhotometryService:
         config = config or PhotometryConfig(aperture_radius=aperture_radius)
         config.aperture_radius = aperture_radius
         alignment_path = project.outputs_dir / StageID.ALIGNMENT.value / "alignment.json"
-        alignment_records = []
-        if alignment_path.exists():
-            alignment_records = json.loads(alignment_path.read_text(encoding="utf-8"))
-            failed_frames = {
-                str(record.get("file"))
-                for record in alignment_records
-                if record.get("failed")
-            }
-            frames = [path for path in frames if path.name not in failed_frames]
-            if not frames:
-                raise LEAPSError(
-                    "PHOTOMETRY_ALIGNMENT_MISSING",
-                    "No successfully aligned frames are available",
-                    "Review the Alignment diagnostics and rerun that stage.",
-                    ["Open Alignment", "Review diagnostics"],
-                    stage=StageID.PHOTOMETRY,
-                )
+        alignment_records = json.loads(alignment_path.read_text(encoding="utf-8"))
         transforms = {record.get("file"): self._alignment_matrix(record) for record in alignment_records}
         reference_transform = transforms.get(frames[0].name, np.eye(3))
         try:
@@ -1969,6 +2339,12 @@ class FittingService:
                 stage=StageID.FITTING,
                 technical_details=f"{light_curve_path}\n{exc}",
             ) from exc
+        entered_mid_time = parameters.mid_time
+        normalized_mid_time = _normalize_mid_transit_time(
+            entered_mid_time, light_curve[0]
+        )
+        if normalized_mid_time != entered_mid_time:
+            parameters = replace(parameters, mid_time=normalized_mid_time)
         tess_import = project.manifest.settings.get("tess_import")
         tess_metadata: dict[str, Any] | None = None
         time_format = "JD_UTC"
@@ -2131,6 +2507,10 @@ class FittingService:
                     "points_passed_to_hops": int(light_curve.shape[1]),
                 },
                 "parameters": asdict(parameters),
+                "timing_input": {
+                    "entered_mid_time": entered_mid_time,
+                    "normalized_mid_time": parameters.mid_time,
+                },
                 "fitted_ephemeris": {
                     "period": parameters.period,
                     "mid_time": fitted_mid_time or parameters.mid_time,
@@ -2170,6 +2550,30 @@ class FittingService:
             ) from exc
         except plc.PyLCInputError as exc:
             project.discard_pending_transaction(StageID.FITTING)
+            if "only transit observation" in str(exc).casefold():
+                observation_center = float(np.median(light_curve[0]))
+                epoch = round(
+                    (observation_center - parameters.mid_time) / parameters.period
+                )
+                predicted_mid_time = parameters.mid_time + epoch * parameters.period
+                raise LEAPSError(
+                    "FITTING_TIMING_CLASSIFIED_AS_ECLIPSE",
+                    "The mid-transit timing does not match this observation",
+                    "HOPS classified these measurements as closer to a secondary eclipse than a primary transit.",
+                    [
+                        "Enter the full BJD, BJD minus 2450000, or only the decimal-day fraction",
+                        "Verify the orbital period",
+                        "Retry Preview Fit",
+                    ],
+                    stage=StageID.FITTING,
+                    technical_details=(
+                        f"Observation midpoint: {observation_center:.8f}\n"
+                        f"Entered mid-transit: {entered_mid_time:.8f}\n"
+                        f"Normalized mid-transit: {parameters.mid_time:.8f}\n"
+                        f"Nearest predicted primary transit: {predicted_mid_time:.8f}\n"
+                        f"HOPS: {exc}"
+                    ),
+                ) from exc
             raise LEAPSError(
                 "FITTING_INPUT_INVALID",
                 "The fitting setup needs attention",
