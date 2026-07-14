@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -301,6 +302,16 @@ def test_frame_assignment_cards_use_live_filename_classifiers(qapp) -> None:
     assert page.counts.text() == "4 assigned · 0 unmatched"
 
 
+def test_data_target_page_exposes_tess_light_curve_import(qapp) -> None:
+    page = DataTargetPage()
+    assert page.import_tess.text() == "Import TESS light curves"
+    assert "PDCSAP" in page.import_tess.toolTip()
+    page.show_tess_import_result("Imported 1,234 TESS points.")
+    assert not page.tess_import_status.isHidden()
+    assert "1,234" in page.tess_import_status.text()
+    page.close()
+
+
 def test_frame_assignment_counts_filename_matches_before_header_scan(qapp, tmp_path) -> None:
     for index in range(21):
         (tmp_path / f"bias_{index + 1:03d}.fits").touch()
@@ -574,6 +585,35 @@ def test_open_existing_project_accepts_run_or_leaps_folder_and_opens_eclipse(qap
         status=StageStatus.COMPLETE, summary="Imported primary-transit fit"
     )
     project.save()
+    fitting = project.outputs_dir / StageID.FITTING.value
+    fitting.mkdir()
+    (fitting / "fit-summary.json").write_text(
+        json.dumps(
+            {
+                "passband": "TESS",
+                "light_curve": "aperture",
+                "parameters": {
+                    "name": "WASP-18 b",
+                    "ra": "01:37:25.07",
+                    "dec": "-45:40:40.10",
+                    "period": 0.941452,
+                    "mid_time": 2458354.458,
+                    "rp_over_rs": 0.1018,
+                    "sma_over_rs": 3.48,
+                    "inclination": 83.5,
+                    "eccentricity": 0.0,
+                    "periastron": 0.0,
+                    "metallicity": 0.0,
+                    "temperature": 6432.0,
+                    "logg": 4.31,
+                    "source": "Test",
+                    "source_date": "",
+                },
+                "fitted_ephemeris": {"period": 0.941452, "mid_time": 2458354.458},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     window = MainWindow(settings=settings)
     window.open_existing_project(root / "LEAPS")

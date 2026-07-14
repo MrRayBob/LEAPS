@@ -37,6 +37,12 @@ Raw FITS files are opened read-only. LEAPS creates a visible, portable `LEAPS/` 
 
 To resume an existing run, use **Data & Target → Open project** and choose the observing-run folder containing `LEAPS/project.json` (or the `LEAPS` folder itself). LEAPS restores the saved workflow state without rescanning or changing raw FITS files.
 
+## TESS light-curve import
+
+Use **Data & Target → Import TESS light curves** to select one or more downloaded TESS SPOC `*_lc.fits` products for a single TIC target. LEAPS reads their calibrated `PDCSAP_FLUX` values and mission quality flags without changing the source files, creates a portable `TESS-TIC-<id>/LEAPS/` project beside the selected data, and opens **Fitting**.
+
+The primary-transit fit is catalog-guided: LEAPS refines the known ephemeris with Box Least Squares, phase-folds the many TESS epochs into one HOPS-compatible transit fit, and then enables **Secondary Eclipse** after a completed full fit. TESS target-pixel files and full-frame images are deliberately not accepted here; they require a separate photometric-extraction workflow before fitting.
+
 ## Secondary eclipse analysis
 
 Run a full primary-transit fit first, then open **Secondary Eclipse**. LEAPS carries forward the saved ephemeris and approved aperture/PSF light curve, suggests a duration from the transit geometry, and evaluates only the expected occultation phase (normally 0.50 for a circular orbit). It also fits nearby control phases and scales the depth uncertainty for time-correlated noise.

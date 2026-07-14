@@ -33,6 +33,7 @@ HOPS_PASSBANDS: tuple[Passband, ...] = (
     Passband("SDSS r'", "sdss_r", ("rp", "rprime", "sdssr")),
     Passband("SDSS i'", "sdss_i", ("ip", "iprime", "sdssi")),
     Passband("SDSS z'", "sdss_z", ("zp", "zprime", "sdssz")),
+    Passband("TESS", "TESS", ("tess band", "tesspassband")),
 )
 
 

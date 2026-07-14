@@ -127,6 +127,7 @@ class DataTargetPage(QWidget):
     saveRequested = Signal(dict)
     targetLookupRequested = Signal(str)
     openProjectRequested = Signal(object)
+    tessImportRequested = Signal(object)
     revealProjectRequested = Signal()
     resetProjectRequested = Signal()
 
@@ -136,7 +137,8 @@ class DataTargetPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         header = PageHeader(
-            "Data & Target", "Choose a FITS folder, verify the target, and confirm frame assignments."
+            "Data & Target",
+            "Choose a ground-based FITS run, import TESS light curves, or resume an existing project.",
         )
         outer.addWidget(header)
 
@@ -254,6 +256,30 @@ class DataTargetPage(QWidget):
         pick.addWidget(browse)
         pick.addWidget(self.open_existing_project)
         folder_layout.addLayout(pick)
+        tess_row = QHBoxLayout()
+        tess_row.setContentsMargins(0, 2, 0, 0)
+        tess_copy = QLabel(
+            "Already downloaded TESS light-curve FITS files? Import their calibrated PDCSAP photometry directly."
+        )
+        tess_copy.setObjectName("muted")
+        tess_copy.setWordWrap(True)
+        tess_row.addWidget(tess_copy, 1)
+        self.import_tess = ActionButton(
+            "Import TESS light curves",
+            "fa6s.file-import",
+            tooltip=(
+                "Select one or more downloaded TESS SPOC *_lc.fits files containing calibrated PDCSAP photometry. "
+                "LEAPS keeps them read-only, creates a TESS project beside the selected data, and opens Fitting."
+            ),
+        )
+        self.import_tess.clicked.connect(self._choose_tess_light_curves)
+        tess_row.addWidget(self.import_tess)
+        folder_layout.addLayout(tess_row)
+        self.tess_import_status = QLabel("")
+        self.tess_import_status.setObjectName("muted")
+        self.tess_import_status.setWordWrap(True)
+        self.tess_import_status.setVisible(False)
+        folder_layout.addWidget(self.tess_import_status)
         self.scan_progress = QProgressBar()
         self.scan_progress.setVisible(False)
         folder_layout.addWidget(self.scan_progress)
@@ -402,6 +428,24 @@ class DataTargetPage(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Open existing LEAPS project")
         if folder:
             self.openProjectRequested.emit(Path(folder))
+
+    def _choose_tess_light_curves(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import TESS light curves",
+            str(Path.home() / "Downloads"),
+            "TESS light curves (*_lc.fits *_lc.fit *.fits *.fit);;All files (*)",
+        )
+        if files:
+            self.tessImportRequested.emit([Path(path) for path in files])
+
+    def set_tess_import_busy(self, busy: bool) -> None:
+        self.import_tess.set_running(busy, "Importing TESS data…")
+        self.import_tess.setEnabled(not busy)
+
+    def show_tess_import_result(self, message: str) -> None:
+        self.tess_import_status.setText(message)
+        self.tess_import_status.setVisible(True)
 
     def _target_name_edited(self) -> None:
         self._lookup_requested_name = ""
@@ -1921,7 +1965,12 @@ class FittingPage(QWidget):
             self.filter.setEditText(canonical)
         self.filter.blockSignals(False)
         exposure = f"{exposure_time:g} s exposures" if exposure_time else "exposure time unavailable"
-        if canonical:
+        if filter_status == "tess":
+            tess_cadence = f"{exposure_time:g} s cadence" if exposure_time else "cadence unavailable"
+            self.observation_source.setText(
+                f"TESS band · {tess_cadence} · imported calibrated PDCSAP light curve"
+            )
+        elif canonical:
             self.observation_source.setText(
                 f"{passband_label(canonical)} ({canonical}) · {exposure} · detected from science FITS"
             )

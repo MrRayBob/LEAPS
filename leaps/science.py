@@ -7,7 +7,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1735,6 +1735,18 @@ class FittingService:
                 stage=StageID.FITTING,
                 technical_details=f"{light_curve_path}\n{exc}",
             ) from exc
+        tess_import = project.manifest.settings.get("tess_import")
+        tess_metadata: dict[str, Any] | None = None
+        time_format = "JD_UTC"
+        time_stamp = "start"
+        if isinstance(tess_import, dict):
+            check_cancelled()
+            light_curve, parameters, tess_metadata = self._prepare_tess_phase_folded_curve(
+                light_curve,
+                parameters,
+            )
+            time_format = "BJD_TDB"
+            time_stamp = "mid"
         if filter_name not in plc.all_filters():
             raise LEAPSError(
                 "FITTING_FILTER_UNAVAILABLE",
@@ -1770,7 +1782,9 @@ class FittingService:
         has_observer_location = latitude is not None and longitude is not None
         detrending_key = detrending.strip().casefold()
         if detrending_key == "automatic":
-            detrending_key = "airmass" if has_observer_location else "linear"
+            detrending_key = "linear" if tess_metadata is not None else (
+                "airmass" if has_observer_location else "linear"
+            )
         detrending_options = {
             "airmass": ("airmass", 1),
             "quadratic": ("time", 2),
@@ -1784,6 +1798,14 @@ class FittingService:
                 ["Choose Airmass, Quadratic, or Linear"],
                 stage=StageID.FITTING,
                 technical_details=f"Selected de-trending method: {detrending}",
+            )
+        if tess_metadata is not None and detrending_key == "airmass":
+            raise LEAPSError(
+                "TESS_AIRMASS_UNAVAILABLE",
+                "Airmass is not available for TESS data",
+                "TESS photometry is space-based. Use Linear or Quadratic de-trending for the phase-folded primary transit.",
+                ["Choose Linear de-trending", "Choose Quadratic de-trending"],
+                stage=StageID.FITTING,
             )
         if detrending_key == "airmass" and not has_observer_location:
             raise LEAPSError(
@@ -1799,9 +1821,9 @@ class FittingService:
         try:
             planet.add_observation(
                 time=light_curve[0],
-                time_format="JD_UTC",
+                time_format=time_format,
                 exp_time=exposure_time,
-                time_stamp="start",
+                time_stamp=time_stamp,
                 flux=light_curve[1],
                 flux_unc=light_curve[2],
                 flux_format="flux",
@@ -1876,6 +1898,8 @@ class FittingService:
                     "time_standard": "BJD_TDB",
                 },
             }
+            if tess_metadata is not None:
+                summary["tess_phase_folded_fit"] = tess_metadata
             if full and pending is not None and target is not None:
                 (pending / "fit-summary.json").write_text(
                     json.dumps(summary, indent=2), encoding="utf-8"
@@ -1928,6 +1952,160 @@ class FittingService:
                 stage=StageID.FITTING,
                 technical_details=str(exc),
             ) from exc
+
+    @staticmethod
+    def _prepare_tess_phase_folded_curve(
+        light_curve: np.ndarray,
+        parameters: PlanetParameters,
+    ) -> tuple[np.ndarray, PlanetParameters, dict[str, Any]]:
+        """Refine a known TESS transit ephemeris and fold it into one HOPS observation.
+
+        HOPS is designed for a single ground-based observing run.  A TESS
+        download can span many sectors and contain both primary and secondary
+        events, so passing the full time series to HOPS makes it classify the
+        observation incorrectly.  This catalog-guided BLS step finds the
+        primary transit near the known period, then phase-folds and bins only a
+        local primary-transit window for the normal HOPS fit.
+        """
+        from astropy.time import Time
+        from astropy.timeseries import BoxLeastSquares
+
+        time_utc, flux, uncertainty = (np.asarray(column, dtype=float) for column in light_curve[:3])
+        times_bjd = np.asarray(Time(time_utc, format="jd", scale="utc").tdb.jd, dtype=float)
+        period_catalog = float(parameters.period)
+        if not math.isfinite(period_catalog) or period_catalog <= 0:
+            raise LEAPSError(
+                "TESS_PERIOD_INVALID",
+                "The catalog period needs attention",
+                "A positive catalog period is needed to phase-fold imported TESS data.",
+                ["Choose a catalogued planet", "Check the period in Fitting"],
+                stage=StageID.FITTING,
+            )
+        duration_hours = SecondaryEclipseService.estimate_duration_hours(parameters)
+        duration_days = max(duration_hours / 24.0, 1.0 / 24.0)
+        search_half_width = max(3.0e-5, min(0.02, period_catalog * 0.002))
+        lower_period = max(duration_days * 1.5, period_catalog - search_half_width)
+        periods = np.linspace(lower_period, period_catalog + search_half_width, 1001)
+        durations = np.unique(
+            np.clip(
+                duration_days * np.asarray((0.65, 0.8, 1.0, 1.2, 1.45)),
+                1.0 / 24.0,
+                lower_period * 0.3,
+            )
+        )
+        refined_period = period_catalog
+        refined_mid_time = float(parameters.mid_time)
+        bls_power: float | None = None
+        try:
+            bls = BoxLeastSquares(times_bjd, flux, dy=uncertainty)
+            result = bls.power(periods, durations, objective="snr")
+            index = int(np.nanargmax(result.power))
+            candidate_period = float(result.period[index])
+            candidate_mid_time = float(result.transit_time[index])
+            candidate_power = float(result.power[index])
+            if (
+                math.isfinite(candidate_period)
+                and candidate_period > 0
+                and math.isfinite(candidate_mid_time)
+                and math.isfinite(candidate_power)
+            ):
+                refined_period = candidate_period
+                refined_mid_time = candidate_mid_time
+                bls_power = candidate_power
+        except (ValueError, FloatingPointError, IndexError):
+            # The catalog ephemeris remains a safe fallback when BLS cannot be
+            # evaluated, for example for a short or unusually noisy sector.
+            pass
+
+        refined_parameters = replace(
+            parameters,
+            period=refined_period,
+            mid_time=refined_mid_time,
+        )
+        phase = np.mod((times_bjd - refined_mid_time) / refined_period + 0.5, 1.0) - 0.5
+        duration_phase = duration_days / refined_period
+        window_phase = min(0.18, max(0.025, duration_phase * 2.5))
+        local = np.abs(phase) <= window_phase
+        if int(local.sum()) < 30:
+            raise LEAPSError(
+                "TESS_PRIMARY_TRANSIT_UNCOVERED",
+                "The imported TESS data do not cover enough primary transit",
+                "LEAPS could not build a phase-folded primary-transit fit near the catalog ephemeris.",
+                ["Choose more TESS sectors", "Check the selected planet and ephemeris"],
+                stage=StageID.FITTING,
+            )
+        folded = FittingService._bin_tess_phase_curve(
+            phase[local],
+            flux[local],
+            uncertainty[local],
+            mid_time=refined_mid_time,
+            period=refined_period,
+            window_phase=window_phase,
+        )
+        if folded.shape[1] < 20:
+            raise LEAPSError(
+                "TESS_PRIMARY_TRANSIT_SPARSE",
+                "The phase-folded TESS transit is too sparse",
+                "LEAPS could not form enough reliable phase bins for a primary-transit fit.",
+                ["Choose more TESS sectors", "Check the selected planet and ephemeris"],
+                stage=StageID.FITTING,
+            )
+        return (
+            folded,
+            refined_parameters,
+            {
+                "method": "catalog-guided Box Least Squares + phase-folded HOPS transit fit",
+                "source_points": int(time_utc.size),
+                "local_primary_points": int(local.sum()),
+                "phase_bins": int(folded.shape[1]),
+                "period_catalog_days": period_catalog,
+                "period_bls_days": refined_period,
+                "mid_time_bls_bjd_tdb": refined_mid_time,
+                "bls_snr": bls_power,
+                "duration_hours": duration_hours,
+                "window_phase": window_phase,
+            },
+        )
+
+    @staticmethod
+    def _bin_tess_phase_curve(
+        phase: np.ndarray,
+        flux: np.ndarray,
+        uncertainty: np.ndarray,
+        *,
+        mid_time: float,
+        period: float,
+        window_phase: float,
+    ) -> np.ndarray:
+        """Compress a many-sector TESS phase curve without hiding its scatter."""
+        order = np.argsort(phase)
+        phase, flux, uncertainty = phase[order], flux[order], uncertainty[order]
+        cadence_phase = float(np.nanmedian(np.diff(phase))) if phase.size > 1 else 0.0
+        target_width = max(cadence_phase, 2.0 * window_phase / 320.0)
+        bin_count = int(np.clip(round(2.0 * window_phase / target_width), 60, 360))
+        edges = np.linspace(-window_phase, window_phase, bin_count + 1)
+        assignment = np.clip(np.digitize(phase, edges) - 1, 0, bin_count - 1)
+        times: list[float] = []
+        fluxes: list[float] = []
+        uncertainties: list[float] = []
+        for index in range(bin_count):
+            points = assignment == index
+            count = int(points.sum())
+            if count < 2:
+                continue
+            local_uncertainty = uncertainty[points]
+            weights = 1.0 / np.square(local_uncertainty)
+            weight_sum = float(weights.sum())
+            if not math.isfinite(weight_sum) or weight_sum <= 0:
+                continue
+            phase_value = float(np.average(phase[points], weights=weights))
+            flux_value = float(np.average(flux[points], weights=weights))
+            formal = math.sqrt(1.0 / weight_sum)
+            scatter = float(np.std(flux[points], ddof=1)) / math.sqrt(count)
+            times.append(mid_time + phase_value * period)
+            fluxes.append(flux_value)
+            uncertainties.append(max(formal, scatter))
+        return np.asarray((times, fluxes, uncertainties), dtype=float)
 
 
 class SecondaryEclipseService:
@@ -2028,12 +2206,21 @@ class SecondaryEclipseService:
         )
         check_cancelled()
         time_utc, flux, uncertainty = self._load_curve(project, light_curve)
-        times_bjd, time_standard = self._to_bjd_tdb(
-            time_utc,
-            parameters,
-            latitude=latitude,
-            longitude=longitude,
-        )
+        if isinstance(project.manifest.settings.get("tess_import"), dict):
+            # The importer converted mission BJD_TDB values through UTC only
+            # to match LEAPS' on-disk light-curve convention.  Convert them
+            # back without adding a ground-observatory light-travel term.
+            from astropy.time import Time
+
+            times_bjd = np.asarray(Time(time_utc, format="jd", scale="utc").tdb.jd, dtype=float)
+            time_standard = "TESS BJD_TDB (mission-corrected)"
+        else:
+            times_bjd, time_standard = self._to_bjd_tdb(
+                time_utc,
+                parameters,
+                latitude=latitude,
+                longitude=longitude,
+            )
         check_cancelled()
         _emit(
             emit,
@@ -2090,7 +2277,7 @@ class SecondaryEclipseService:
         )
         if outcome == "candidate" and event_count < 2:
             message += " Only one eclipse window is represented, so independent data are essential."
-        if time_standard != "BJD_TDB":
+        if time_standard not in {"BJD_TDB", "TESS BJD_TDB (mission-corrected)"}:
             message += " Set observatory coordinates for a barycentric timing correction."
         check_cancelled()
 

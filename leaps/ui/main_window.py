@@ -58,6 +58,7 @@ from leaps.science import (
     SecondaryEclipseService,
 )
 from leaps.targets import ResolvedTarget, TargetNameResolver
+from leaps.tess import TessImportResult, TessImportService
 
 from .pages import (
     ComparisonStarsPage,
@@ -406,6 +407,7 @@ class MainWindow(QMainWindow):
         self.data_page.saveRequested.connect(self.save_data_target)
         self.data_page.targetLookupRequested.connect(self.resolve_target_name)
         self.data_page.openProjectRequested.connect(self.open_existing_project)
+        self.data_page.tessImportRequested.connect(self.import_tess_light_curves)
         self.data_page.revealProjectRequested.connect(self.open_project_folder)
         self.data_page.resetProjectRequested.connect(self.request_project_reset)
         self.runner.busyChanged.connect(self._runner_busy_changed)
@@ -696,6 +698,42 @@ class MainWindow(QMainWindow):
             )
         except BaseException as exc:
             self._handle_error(exc)
+
+    def import_tess_light_curves(self, selected_files: list[Path]) -> None:
+        """Import local TESS SPOC light-curve files and continue at primary fitting."""
+        if not self._ensure_runner_idle("import TESS light curves", StageID.DATA_TARGET):
+            return
+        self.data_page.set_tess_import_busy(True)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Importing TESS PDCSAP light curves…")
+
+        def import_tess(*, emit=None, token=None):
+            return TessImportService().run(selected_files, emit=emit, token=token)
+
+        self.runner.start(
+            import_tess,
+            event=self._stage_event,
+            result=self._tess_import_complete,
+            error=self._tess_import_failed,
+            finished=lambda: self.data_page.set_tess_import_busy(False),
+            operation="TESS light-curve import",
+        )
+
+    def _tess_import_complete(self, result: TessImportResult) -> None:
+        self.records = []
+        self.set_project(result.project)
+        sectors = ", ".join(str(sector) for sector in result.sectors) or "unknown sector"
+        self.data_page.show_tess_import_result(
+            f"Imported {result.imported_points:,} quality-filtered PDCSAP points from TESS sector(s) {sectors}. "
+            "Raw TESS FITS files were not changed."
+        )
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("TESS light curve imported · choose a planet and preview the primary transit")
+        self.autosave.setText("autosaved just now")
+        self.open_stage(StageID.FITTING)
+
+    def _tess_import_failed(self, exc: BaseException) -> None:
+        self._handle_error(exc)
 
     def _nasa_snapshot_path(self) -> Path | None:
         folder = self.offline_manager.root / "nasa"
@@ -1410,7 +1448,10 @@ class MainWindow(QMainWindow):
         previous = project.manifest.settings.get("fitting_setup", {})
         latitude = _optional_float(project.manifest.global_profile.get("latitude"))
         longitude = _optional_float(project.manifest.global_profile.get("longitude"))
-        default_detrending = "airmass" if latitude is not None and longitude is not None else "linear"
+        tess_import = isinstance(project.manifest.settings.get("tess_import"), dict)
+        default_detrending = (
+            "linear" if tess_import or latitude is None or longitude is None else "airmass"
+        )
         light_curve = str(previous.get("light_curve", "aperture"))
         detrending = str(previous.get("detrending", default_detrending))
         candidate_names = {parameters.name.casefold(): parameters.name for parameters in candidates}
@@ -1443,7 +1484,12 @@ class MainWindow(QMainWindow):
             else None,
             filter_status=str(observation.get("filter_status", "unknown")),
         )
-        if latitude is None or longitude is None:
+        if tess_import:
+            self.fitting_page.observation_source.setText(
+                self.fitting_page.observation_source.text()
+                + " · primary transit will be BLS-refined and phase-folded before the HOPS fit"
+            )
+        elif latitude is None or longitude is None:
             self.fitting_page.observation_source.setText(
                 self.fitting_page.observation_source.text()
                 + " · observer location not set; Airmass de-trending requires a location"
@@ -1553,17 +1599,20 @@ class MainWindow(QMainWindow):
             rp_over_rs=max(float(values["depth"]), 0.0) ** 0.5,
         )
         profile = self.project.manifest.global_profile
-        latitude = _optional_float(profile.get("latitude"))
-        longitude = _optional_float(profile.get("longitude"))
+        tess_import = isinstance(self.project.manifest.settings.get("tess_import"), dict)
+        latitude = None if tess_import else _optional_float(profile.get("latitude"))
+        longitude = None if tess_import else _optional_float(profile.get("longitude"))
         project = self.project
         setup = project.manifest.settings.get("fitting_setup", {})
         setup["selected_planet"] = parameters.name
         setup["light_curve"] = str(values.get("light_curve", "aperture"))
         setup["detrending"] = str(
-            values.get(
-                "detrending",
-                "airmass" if latitude is not None and longitude is not None else "linear",
-            )
+                values.get(
+                    "detrending",
+                    "linear"
+                    if tess_import or latitude is None or longitude is None
+                    else "airmass",
+                )
         )
         project.manifest.settings["filter"] = filter_name
         project.manifest.settings["fitting_setup"] = setup
