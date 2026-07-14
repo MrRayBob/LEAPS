@@ -64,6 +64,27 @@ def _read_fits_image(path: Path) -> tuple[np.ndarray, Any]:
     return data, header
 
 
+def _detector_saturation_limit(data: np.ndarray, header: Any) -> float:
+    """Return the detector ceiling without treating the brightest star as saturated."""
+    for key in ("HOPSSAT", "SATURATE"):
+        try:
+            value = float(header[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    try:
+        from hops.hops_tools.image_analysis import image_burn_limit
+
+        value = float(image_burn_limit(header))
+        if math.isfinite(value) and value > 0:
+            return value
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
+    maximum = float(np.nanmax(data))
+    return maximum + max(abs(maximum) * 0.1, 1.0)
+
+
 class CancellationToken:
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -350,7 +371,7 @@ class ReductionService:
         from hops.hops_tools.image_analysis import image_mean_std, image_psf
 
         mean, std = image_mean_std(data)
-        saturation = float(header.get("SATURATE", np.nanmax(data)))
+        saturation = _detector_saturation_limit(data, header)
         psf = image_psf(data, header, mean, std, saturation)
         return float(mean), float(std), float(psf)
 
@@ -672,7 +693,7 @@ class PlateSolveService:
         mean = float(header.get("HOPSMEAN", np.nanmedian(data)))
         std = float(header.get("HOPSSTD", 1.4826 * np.nanmedian(np.abs(data - mean))))
         psf = max(float(header.get("HOPSPSF", 2.0)), 1.0)
-        burn_limit = float(header.get("HOPSSAT", header.get("SATURATE", np.nanmax(data))))
+        burn_limit = _detector_saturation_limit(data, header)
         stars = image_find_stars(
             data,
             header,
@@ -1035,9 +1056,7 @@ class PhotometryService:
         mean = float(header.get("HOPSMEAN", np.nanmedian(data)))
         std = float(header.get("HOPSSTD", 1.4826 * np.nanmedian(np.abs(data - mean))))
         psf = max(float(header.get("HOPSPSF", 2.0)), 1.0)
-        saturation = float(
-            header.get("HOPSSAT", header.get("SATURATE", np.nanmax(data)))
-        ) * config.saturation_fraction
+        saturation = _detector_saturation_limit(data, header) * config.saturation_fraction
         search = max(5.0 * psf, aperture * 2.0)
         stars = image_find_stars(
             data,
@@ -1145,7 +1164,7 @@ class PhotometryService:
             distance = math.hypot(x - tx, y - ty)
             if distance < max(10.0, float(header.get("HOPSPSF", 3)) * 5):
                 continue
-            saturation = float(header.get("HOPSSAT", np.nanmax(data)))
+            saturation = _detector_saturation_limit(data, header)
             flux_similarity = abs(math.log10(max(flux, 1) / max(target_flux, 1)))
             score = 1.0 - flux_similarity - 0.02 * math.log10(max(distance, 1))
             if peak >= 0.95 * saturation:

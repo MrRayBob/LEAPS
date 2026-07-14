@@ -910,6 +910,27 @@ def test_process_start_stops_and_requests_access_when_project_preflight_fails(
     window.close()
 
 
+def test_target_selection_failure_never_tells_user_to_choose_another_star(qapp) -> None:
+    window = MainWindow(demo=True)
+    failures: list[LEAPSError] = []
+    window._handle_error = failures.append
+    generic = LEAPSError(
+        "PHOTOMETRY_STAR_NOT_FOUND",
+        "No acceptable star was found at that position",
+        "Click closer to the center of an unsaturated star.",
+        ["Choose another star", "Adjust advanced detection settings"],
+        stage=StageID.PHOTOMETRY,
+    )
+
+    window._photometry_star_selection_failed("target", generic)
+
+    assert failures[0].code == "PHOTOMETRY_TARGET_NOT_CENTERED"
+    assert "not replaced" in failures[0].message
+    assert "another star" not in " ".join(failures[0].recovery).casefold()
+    assert "same target" in " ".join(failures[0].recovery).casefold()
+    window.close()
+
+
 def test_project_access_dialog_reopens_native_picker_and_rechecks_project(
     qapp, tmp_path, monkeypatch
 ) -> None:

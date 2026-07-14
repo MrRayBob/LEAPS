@@ -1363,7 +1363,12 @@ class MainWindow(QMainWindow):
             self._apply_manifest(self.project.manifest)
 
     def select_photometry_star(self, role: str, x: float, y: float) -> None:
-        if not self._ensure_runner_idle("refine another star", StageID.PHOTOMETRY):
+        requested = (
+            "select the target star"
+            if role == "target"
+            else "refine another comparison star"
+        )
+        if not self._ensure_runner_idle(requested, StageID.PHOTOMETRY):
             return
         try:
             frame, _ = self._photometry_inputs(require_target=False)
@@ -1379,7 +1384,7 @@ class MainWindow(QMainWindow):
             y,
             config,
             result=lambda star: self._photometry_star_selected(role, star),
-            error=self._handle_error,
+            error=lambda exc: self._photometry_star_selection_failed(role, exc),
             finished=lambda: self.status_text.setText("Photometry setup ready"),
             inhibit_sleep=False,
             operation="star-position refinement",
@@ -1398,11 +1403,34 @@ class MainWindow(QMainWindow):
             self.manual_target_placed(star["x"], star["y"])
             self.plate_page.inspector.banner_title.setText("Manual target selected")
             self.plate_page.inspector.explanation.setText(
-                "The target was refined to the nearest acceptable star. Add comparison stars to continue."
+                "The click was centered on the selected target star. Add comparison stars to continue."
             )
         else:
             self.plate_page.add_comparison(star["x"], star["y"], radius=radius)
         self._save_photometry_selection(verified=self.plate_page.target_verified)
+
+    def _photometry_star_selection_failed(self, role: str, exc: BaseException) -> None:
+        if (
+            role == "target"
+            and isinstance(exc, LEAPSError)
+            and exc.code == "PHOTOMETRY_STAR_NOT_FOUND"
+        ):
+            exc = LEAPSError(
+                "PHOTOMETRY_TARGET_NOT_CENTERED",
+                "The target star could not be centered automatically",
+                (
+                    "LEAPS could not refine this click using the current detection and "
+                    "saturation limits. Your target choice was not replaced."
+                ),
+                [
+                    "Click the center of the same target again",
+                    "Open Advanced settings and review Saturation fraction",
+                    "Use unsaturated exposures if the target reaches the detector limit",
+                ],
+                stage=StageID.PHOTOMETRY,
+                technical_details=exc.technical_details,
+            )
+        self._handle_error(exc)
 
     def _save_photometry_selection(self, *, verified: bool | None = None) -> None:
         if not self.project or not self.plate_page.target:

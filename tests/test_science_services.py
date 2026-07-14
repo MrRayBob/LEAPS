@@ -421,6 +421,38 @@ def test_hops_geometric_center_moves_only_the_aperture_measurement(monkeypatch) 
     assert measurement["y"] == 10.5
 
 
+def test_photometry_uses_detector_range_when_saturation_header_is_missing(
+    monkeypatch,
+) -> None:
+    import hops.hops_tools.image_analysis as image_analysis
+
+    data = np.zeros((16, 16), dtype=float)
+    data[5, 5] = 40_000.0
+    header = fits.Header(
+        {"BITPIX": -32, "HOPSMEAN": 0.0, "HOPSSTD": 1.0, "HOPSPSF": 2.0}
+    )
+    captured: dict[str, float] = {}
+
+    def find_star(*_args, **kwargs):
+        captured["burn_limit"] = float(kwargs["burn_limit"])
+        return [[5.0, 5.0, 30_000.0, 0.0, 2.0, 2.0, 1000.0, 900.0, 100.0, 5.0]]
+
+    monkeypatch.setattr(image_analysis, "image_find_stars", find_star)
+
+    measurement = PhotometryService._locate_star(
+        data,
+        header,
+        5.0,
+        5.0,
+        8.0,
+        PhotometryConfig(),
+    )
+
+    assert captured["burn_limit"] == pytest.approx(0.95 * 65_535)
+    assert captured["burn_limit"] > np.nanmax(data)
+    assert measurement["x"] == 5.0
+
+
 def test_plate_solver_uses_valid_existing_fits_wcs_without_gaia(
     tmp_path: Path, monkeypatch
 ) -> None:
