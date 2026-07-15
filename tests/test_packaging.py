@@ -4,6 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
+def test_release_scientific_stack_stays_within_validated_versions() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        dependencies = tomllib.load(handle)["project"]["dependencies"]
+
+    assert "matplotlib>=3.8,<3.11" in dependencies
+    assert "numpy>=1.26,<2.5" in dependencies
+    assert "astropy>=6.0,<8" in dependencies
+    assert "scipy>=1.10,<1.18" in dependencies
+
+
 def test_deployment_includes_photutils_dynamic_modules() -> None:
     spec = (ROOT / "pysidedeploy.spec").read_text(encoding="utf-8")
     assert "--include-package=photutils" in spec
@@ -25,8 +35,10 @@ def test_macos_bundle_has_stable_privacy_metadata_and_is_resigned() -> None:
     assert 'CFBundleShortVersionString "$VERSION"' in script
 
     spec = (ROOT / "packaging" / "LEAPS-macos.spec").read_text(encoding="utf-8")
-    assert '"hops", "exoclock", "exotethys", "photutils"' in spec
+    assert '"hops", "exotethys", "photutils"' in spec
+    assert 'collect_data_files("exoclock")' in spec
     assert 'collect_data_files("astroquery")' in spec
+    assert 'collect_data_files("pyvo")' in spec
     assert '"matplotlib.backends.backend_pdf"' in spec
     assert "NSDocumentsFolderUsageDescription" in spec
     assert "NSRemovableVolumesUsageDescription" in spec
@@ -45,10 +57,17 @@ def test_windows_build_uses_fast_pyinstaller_bundle_and_runs_self_test() -> None
 
     spec = (ROOT / "packaging" / "LEAPS-windows.spec").read_text(encoding="utf-8")
     assert 'collect_all(package)' in spec
-    assert '"hops", "exoclock", "exotethys", "photutils"' in spec
+    assert '"hops", "exotethys", "photutils"' in spec
+    assert 'collect_data_files("exoclock")' in spec
     assert 'collect_data_files("astroquery")' in spec
+    assert 'collect_data_files("pyvo")' in spec
     assert '"matplotlib.backends.backend_pdf"' in spec
     assert 'ROOT = Path(SPECPATH).parent' in spec
+
+    app = (ROOT / "leaps" / "app.py").read_text(encoding="utf-8")
+    assert "_packaging_fitting_self_test" in app
+    assert "FittingService().run" in app
+    assert "import pyvo.samp as pyvo_samp" in app
 
 
 def test_release_workflow_can_build_windows_without_rebuilding_macos() -> None:

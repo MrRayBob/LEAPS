@@ -17,13 +17,15 @@ hiddenimports = [
     "matplotlib.backends.backend_pdf",
 ]
 
-for package in ("hops", "exoclock", "exotethys", "photutils"):
+for package in ("hops", "exotethys", "photutils"):
     package_datas, package_binaries, package_imports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_imports
 
+datas += collect_data_files("exoclock")
 datas += collect_data_files("astroquery")
+datas += collect_data_files("pyvo")
 
 analysis = Analysis(
     [str(ROOT / "leaps" / "app.py")],

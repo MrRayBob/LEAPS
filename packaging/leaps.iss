@@ -1,6 +1,6 @@
 #define MyAppName "LEAPS"
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.0"
+  #define MyAppVersion "2.1.1"
 #endif
 #define MyAppPublisher "LEAPS contributors"
 #ifndef SourceDir

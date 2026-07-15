@@ -1225,6 +1225,8 @@ def test_invalid_prediction_preserves_previous_full_fit(
         )
 
     assert error.value.code == "FITTING_FAILED"
+    assert "Traceback (most recent call last)" in error.value.technical_details
+    assert "predicted transit" in error.value.technical_details
     assert previous_preview.read_bytes() == b"last successful preview"
     assert not (project.temporary_dir / "fitting-pending").exists()
 

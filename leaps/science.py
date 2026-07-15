@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -2610,7 +2611,7 @@ class FittingService:
                 "LEAPS kept the last successful fitting result unchanged.",
                 ["Run Preview Fit", "Review the fitting setup", "Export diagnostics if it repeats"],
                 stage=StageID.FITTING,
-                technical_details=str(exc),
+                technical_details=traceback.format_exc(),
             ) from exc
 
     @staticmethod

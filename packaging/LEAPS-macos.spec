@@ -8,7 +8,7 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 ROOT = Path(SPECPATH).parent
-VERSION = os.environ.get("LEAPS_VERSION", "2.1.0").removeprefix("v")
+VERSION = os.environ.get("LEAPS_VERSION", "2.1.1").removeprefix("v")
 datas = [
     (str(ROOT / "leaps" / "assets"), "leaps/assets"),
     (str(ROOT / "leaps" / "assets"), "assets"),
@@ -19,13 +19,15 @@ hiddenimports = [
     "matplotlib.backends.backend_pdf",
 ]
 
-for package in ("hops", "exoclock", "exotethys", "photutils"):
+for package in ("hops", "exotethys", "photutils"):
     package_datas, package_binaries, package_imports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_imports
 
+datas += collect_data_files("exoclock")
 datas += collect_data_files("astroquery")
+datas += collect_data_files("pyvo")
 
 analysis = Analysis(
     [str(ROOT / "leaps" / "app.py")],
