@@ -59,6 +59,12 @@ The exported `LEAPS/outputs/secondary_eclipse_ml/` folder contains a recovery cu
 python -m pip install -e '.[ml]'
 ```
 
+### Cross-target reliability study
+
+After running the current ML recovery check for at least three TESS targets, open one target's **Secondary Eclipse** page and choose **Run cross-target study**. LEAPS includes that target automatically; select the other targets' `LEAPS/outputs/secondary_eclipse_ml/ml-trials.csv` files. For each planet, it trains and sets the score threshold only on the other planets, then tests the held-out target. This leave-one-planet-out result is exported to `LEAPS/outputs/secondary_eclipse_cross_target_ml/`.
+
+It is deliberately harder than a held-out-sector result. A lower recovery floor only counts as an improvement if the held-out false-alarm rate does not increase. Use it to assess whether a frozen reliability feature set transfers across targets, not to make an ML-only eclipse claim.
+
 ## Test
 
 ```bash

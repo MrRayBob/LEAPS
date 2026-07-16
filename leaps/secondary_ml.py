@@ -39,6 +39,8 @@ FEATURE_NAMES = (
     "Strongest nearby-control S/N",
     "Positive-depth sector fraction",
     "Inter-sector depth scatter",
+    "Baseline-to-baseline depth shift",
+    "Positive depth under both baselines",
 )
 FEATURE_KEYS = (
     "depth_ppm",
@@ -50,6 +52,8 @@ FEATURE_KEYS = (
     "control_significance",
     "positive_sector_fraction",
     "sector_depth_scatter",
+    "detrending_depth_shift",
+    "detrending_positive_agreement",
 )
 DEFAULT_DEPTHS_PPM = (25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 400.0)
 
@@ -291,6 +295,15 @@ class _InjectionGroup:
             window_phase=window_phase,
             baseline=baseline,
         )
+        self.alternate_baseline = self._alternate_baseline(baseline)
+        self.detrending_evaluator = _FixedPhaseEvaluator(
+            expected,
+            self.time,
+            self.uncertainty,
+            duration_phase=duration_phase,
+            window_phase=window_phase,
+            baseline=self.alternate_baseline,
+        )
         self.control_evaluators = [
             _FixedPhaseEvaluator(
                 SecondaryEclipseService._relative_phase(
@@ -328,6 +341,13 @@ class _InjectionGroup:
                     ),
                 )
             )
+
+    @staticmethod
+    def _alternate_baseline(baseline: str) -> str:
+        """Choose one nearby, defensible local baseline for a stability check."""
+        if baseline == "quadratic":
+            return "linear"
+        return "quadratic"
 
     def generate(
         self,
@@ -399,6 +419,27 @@ class _InjectionGroup:
                     np.sum(weights * np.square(sector_depths - weighted_depth))
                     / max(1, sector_depths.size - 1)
                 )
+        detrending_fit = self.detrending_evaluator.evaluate(flux)
+        primary_depth = float(fit["depth"])
+        primary_uncertainty = float(fit["depth_uncertainty"])
+        if (
+            detrending_fit["coverage"]["available"]
+            and detrending_fit["depth"] is not None
+            and detrending_fit["depth_uncertainty"] is not None
+            and float(detrending_fit["depth_uncertainty"]) > 0.0
+        ):
+            alternate_depth = float(detrending_fit["depth"])
+            alternate_uncertainty = float(detrending_fit["depth_uncertainty"])
+            combined_uncertainty = math.hypot(primary_uncertainty, alternate_uncertainty)
+            detrending_depth_shift = (
+                abs(primary_depth - alternate_depth) / combined_uncertainty
+                if combined_uncertainty > 0.0
+                else 0.0
+            )
+            detrending_positive_agreement = float(primary_depth > 0.0 and alternate_depth > 0.0)
+        else:
+            detrending_depth_shift = 0.0
+            detrending_positive_agreement = 0.0
         return {
             "depth_ppm": float(fit["depth"]) * 1_000_000.0,
             "depth_uncertainty_ppm": float(fit["depth_uncertainty"]) * 1_000_000.0,
@@ -409,6 +450,8 @@ class _InjectionGroup:
             "control_significance": float(control_significance),
             "positive_sector_fraction": positive_sector_fraction,
             "sector_depth_scatter": sector_depth_scatter,
+            "detrending_depth_shift": float(detrending_depth_shift),
+            "detrending_positive_agreement": detrending_positive_agreement,
         }
 
 
@@ -1026,9 +1069,11 @@ class SecondaryEclipseMLService:
                 "random_seed": random_seed,
                 "features": list(FEATURE_NAMES),
                 "feature_design": (
-                    "Aggregate LEAPS fit metrics plus sector-repeatability features: an astrophysical "
-                    "eclipse should have positive, mutually consistent fixed-phase depths in independent sectors."
+                    "Aggregate LEAPS fit metrics plus sector-repeatability and detrending-stability features: "
+                    "an astrophysical eclipse should have positive, mutually consistent fixed-phase depths in "
+                    "independent sectors and remain stable under nearby local-baseline choices."
                 ),
+                "alternate_baseline": _InjectionGroup._alternate_baseline(baseline),
                 "classifier": "RandomForestClassifier (300 trees, min_samples_leaf=3)",
             },
             "sector_split": {
@@ -1065,6 +1110,7 @@ class SecondaryEclipseMLService:
                 "Negative examples include clean nulls and deliberately off-phase dips, so a strong nearby control phase is represented as structured noise rather than a real occultation.",
                 "Training, threshold-calibration, and test sectors are disjoint. This is a held-out sector test, not a claim of universal performance across planets.",
                 "The two sector-repeatability features are physical consistency checks: the fraction of independent sectors with a positive fitted depth and the uncertainty-weighted scatter of their fitted depths. They are not measurements of an eclipse by themselves.",
+                "The detrending-stability features compare the selected local baseline with one nearby defensible baseline. Their formal depth difference is only a robustness feature because both fits use correlated data; it is not an independent statistical significance.",
                 "A classifier score is acted on only after the positive-depth and nearby-control safety guard already used by LEAPS; it never changes the normal LEAPS secondary-eclipse outcome or turns a marginal signal into a confirmation.",
                 "Use the fixed-phase fit, nearby controls, independent sectors, and injection-recovery curve as the scientific evidence.",
             ],
@@ -1233,5 +1279,621 @@ class SecondaryEclipseMLService:
         feature_axis.tick_params(colors="#c7d5df", labelsize=8.5)
         for spine in feature_axis.spines.values():
             spine.set_color("#49667a")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(destination, dpi=180, facecolor=figure.get_facecolor())
+
+
+@dataclass(slots=True)
+class CrossTargetMLValidationResult:
+    """Summary of a strict leave-one-planet-out reliability check."""
+
+    output_path: Path
+    preview_path: Path
+    summary_path: Path
+    message: str
+    recommendation: str
+    target_count: int
+    aggregate_auc: float
+    aggregate_false_alarm_rate: float
+    raw: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _CrossTargetTrials:
+    planet: str
+    trial_path: Path
+    summary_path: Path
+    rows: list[dict[str, Any]]
+
+
+class CrossTargetSecondaryEclipseMLService:
+    """Test whether the LEAPS ML features transfer to an unseen planet.
+
+    Per-target validation answers whether a classifier can learn a target's
+    particular residual structure.  This service asks the more demanding
+    question: can a model trained and threshold-calibrated only on *other*
+    planets make useful, well-controlled scores on a completely unseen target?
+    It remains a reliability experiment and never changes an eclipse outcome.
+    """
+
+    OUTPUT_NAME = "secondary_eclipse_cross_target_ml"
+    MIN_TARGETS = 3
+
+    @classmethod
+    def availability(cls, project: ProjectWorkspace) -> tuple[bool, str]:
+        current = project.outputs_dir / SecondaryEclipseMLService.OUTPUT_NAME / "ml-trials.csv"
+        if not current.is_file():
+            return (
+                False,
+                "Run this target's optional ML recovery check first, then choose two or more other saved trial tables.",
+            )
+        if not SecondaryEclipseMLService.sklearn_available():
+            return False, "Install the optional ML dependency with: pip install -e '.[ml]'"
+        try:
+            summary = json.loads(current.with_name("ml-summary.json").read_text(encoding="utf-8"))
+            features = summary.get("configuration", {}).get("features", [])
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False, "The current ML validation summary could not be read. Run the recovery check again."
+        if list(features) != list(FEATURE_NAMES):
+            return (
+                False,
+                "Run the current ML recovery check again to create trials with the latest frozen reliability features.",
+            )
+        return (
+            True,
+            "Uses three or more saved ML trial tables. Each planet is tested by a model that never saw its trials.",
+        )
+
+    def run(
+        self,
+        project: ProjectWorkspace,
+        trial_paths: list[str | Path],
+        *,
+        random_seed: int = 20260715,
+        emit: Emitter | None = None,
+        token: CancellationToken | None = None,
+    ) -> CrossTargetMLValidationResult:
+        """Build leave-one-planet-out tests from saved per-target trial tables."""
+        available, message = self.availability(project)
+        if not available:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_UNAVAILABLE",
+                "Cross-target validation is not ready",
+                message,
+                ["Run an ML recovery check", "Choose at least three compatible target trial tables"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        token = token or CancellationToken()
+
+        def check_cancelled() -> None:
+            if token.cancelled:
+                raise LEAPSError(
+                    "JOB_CANCELLED",
+                    "Cross-target ML validation cancelled",
+                    "The incomplete reliability study was discarded. Existing eclipse and ML outputs were preserved.",
+                    ["Run the study again when ready"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+
+        current_trials = project.outputs_dir / SecondaryEclipseMLService.OUTPUT_NAME / "ml-trials.csv"
+        candidate_paths = [Path(path).expanduser().resolve() for path in trial_paths]
+        candidate_paths.append(current_trials.resolve())
+        unique_paths = list(dict.fromkeys(candidate_paths))
+        progress_total = 2 * len(unique_paths) + 1
+        _emit(
+            emit,
+            StageID.SECONDARY_ECLIPSE,
+            JobStatus.RUNNING,
+            "Reading saved target ML trials",
+            0,
+            progress_total,
+            checkpoint="cross_target_prepare",
+        )
+        cases = []
+        for index, path in enumerate(unique_paths, start=1):
+            check_cancelled()
+            cases.append(self._load_case(path))
+            _emit(
+                emit,
+                StageID.SECONDARY_ECLIPSE,
+                JobStatus.RUNNING,
+                f"Loaded ML trials for {cases[-1].planet}",
+                index,
+                progress_total,
+                checkpoint="cross_target_prepare",
+            )
+        if len(cases) < self.MIN_TARGETS:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_TARGETS_REQUIRED",
+                "Choose at least three target trial tables",
+                "Leave-one-planet-out validation needs one held-out target and at least two different planets for training and calibration.",
+                ["Run the per-target ML check for more targets", "Choose their ml-trials.csv files"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        duplicate_planets = self._duplicate_planets(cases)
+        if duplicate_planets:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_DUPLICATE_PLANET",
+                "Each target may appear only once",
+                f"Duplicate trial tables were selected for: {', '.join(duplicate_planets)}.",
+                ["Choose one ml-trials.csv file per planet"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        check_cancelled()
+        evaluations: list[dict[str, Any]] = []
+        combined_rows: list[dict[str, Any]] = []
+        for index, held_out in enumerate(cases, start=1):
+            check_cancelled()
+            other_cases = [case for case in cases if case is not held_out]
+            evaluation, rows = self._evaluate_held_out_target(
+                held_out,
+                other_cases,
+                random_seed=random_seed + index,
+            )
+            evaluations.append(evaluation)
+            combined_rows.extend(rows)
+            _emit(
+                emit,
+                StageID.SECONDARY_ECLIPSE,
+                JobStatus.RUNNING,
+                f"Tested {held_out.planet} without using its trials",
+                len(unique_paths) + index,
+                progress_total,
+                checkpoint="cross_target_test",
+            )
+        check_cancelled()
+        payload = self._summary_payload(cases, evaluations, combined_rows, random_seed=random_seed)
+        pending = project.temporary_dir / "secondary-eclipse-cross-target-ml-pending"
+        target = project.outputs_dir / self.OUTPUT_NAME
+        if pending.exists():
+            shutil.rmtree(pending)
+        pending.mkdir(parents=True)
+        try:
+            self._write_outputs(pending, payload, combined_rows)
+            check_cancelled()
+            if target.exists():
+                previous = target.with_name(target.name + "-previous")
+                if previous.exists():
+                    shutil.rmtree(previous)
+                target.replace(previous)
+                try:
+                    pending.replace(target)
+                finally:
+                    if previous.exists():
+                        shutil.rmtree(previous)
+            else:
+                pending.replace(target)
+        except BaseException:
+            if pending.exists():
+                shutil.rmtree(pending)
+            raise
+        _emit(
+            emit,
+            StageID.SECONDARY_ECLIPSE,
+            JobStatus.SUCCEEDED,
+            "Leave-one-planet-out reliability study complete",
+            progress_total,
+            progress_total,
+            checkpoint="cross_target_complete",
+        )
+        metrics = payload["aggregate_metrics"]
+        return CrossTargetMLValidationResult(
+            output_path=target,
+            preview_path=target / "cross-target-validation.png",
+            summary_path=target / "cross-target-summary.json",
+            message=str(payload["message"]),
+            recommendation=str(payload["recommendation"]),
+            target_count=len(cases),
+            aggregate_auc=float(metrics["roc_auc"]),
+            aggregate_false_alarm_rate=float(metrics["ml_false_alarm_rate"]),
+            raw=payload,
+        )
+
+    @staticmethod
+    def _duplicate_planets(cases: list[_CrossTargetTrials]) -> list[str]:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for case in cases:
+            key = case.planet.casefold()
+            if key in seen:
+                duplicates.append(case.planet)
+            seen.add(key)
+        return duplicates
+
+    @staticmethod
+    def _load_case(path: Path) -> _CrossTargetTrials:
+        if not path.is_file():
+            raise LEAPSError(
+                "CROSS_TARGET_ML_TRIALS_MISSING",
+                "A selected ML trial table is unavailable",
+                "LEAPS could not read one of the selected ml-trials.csv files.",
+                ["Choose the saved trial table again"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=str(path),
+            )
+        summary_path = path.with_name("ml-summary.json")
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = set(reader.fieldnames or [])
+                required = {
+                    "split",
+                    "label_injected_eclipse",
+                    "injected_depth_ppm",
+                    "leaps_candidate_rule",
+                    *FEATURE_KEYS,
+                }
+                missing = sorted(required - fields)
+                if missing:
+                    raise ValueError("missing columns: " + ", ".join(missing))
+                rows = [dict(row) for row in reader]
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_TRIALS_INVALID",
+                "A selected ML trial table is incompatible",
+                "Run the current LEAPS ML recovery check again for this target before using it in a cross-target study.",
+                ["Update that target's ML validation", "Choose compatible ml-trials.csv files"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=f"{path}\n{exc}",
+            ) from exc
+        planet = str(summary.get("planet", "")).strip()
+        if not planet or not rows:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_TRIALS_EMPTY",
+                "A selected ML trial table has no usable target data",
+                "Each input must be a completed LEAPS ML validation output.",
+                ["Run the ML recovery check again"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=str(path),
+            )
+        feature_names = summary.get("configuration", {}).get("features", [])
+        if list(feature_names) != list(FEATURE_NAMES):
+            raise LEAPSError(
+                "CROSS_TARGET_ML_FEATURE_MISMATCH",
+                "The selected targets use different ML feature versions",
+                "Run the current ML recovery check for every target so the cross-target test uses one frozen feature set.",
+                ["Update all target ML outputs", "Then run the cross-target study again"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=str(path),
+            )
+        split_counts = {split: sum(row.get("split") == split for row in rows) for split in ("train", "calibration", "test")}
+        if any(count < 20 for count in split_counts.values()):
+            raise LEAPSError(
+                "CROSS_TARGET_ML_TRIALS_INSUFFICIENT",
+                "A selected target does not have enough saved trial rows",
+                "Each target needs completed training, calibration, and held-out trial groups.",
+                ["Run the per-target ML recovery check again"],
+                stage=StageID.SECONDARY_ECLIPSE,
+                technical_details=f"{path}\n{split_counts}",
+            )
+        return _CrossTargetTrials(planet, path, summary_path, rows)
+
+    @staticmethod
+    def _matrix(rows: list[dict[str, Any]]) -> np.ndarray:
+        return np.asarray([[float(row[key]) for key in FEATURE_KEYS] for row in rows], dtype=float)
+
+    @staticmethod
+    def _labels(rows: list[dict[str, Any]]) -> np.ndarray:
+        return np.asarray([int(row["label_injected_eclipse"]) for row in rows], dtype=int)
+
+    @staticmethod
+    def _candidate(row: dict[str, Any], score: float, threshold: float) -> bool:
+        return bool(score > threshold and SecondaryEclipseMLService._leaps_control_guard(row))
+
+    def _evaluate_held_out_target(
+        self,
+        held_out: _CrossTargetTrials,
+        training_cases: list[_CrossTargetTrials],
+        *,
+        random_seed: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import roc_auc_score
+
+        training_rows = [row for case in training_cases for row in case.rows if row["split"] == "train"]
+        calibration_rows = [
+            row for case in training_cases for row in case.rows if row["split"] == "calibration"
+        ]
+        test_rows = [row for row in held_out.rows if row["split"] == "test"]
+        train_y = self._labels(training_rows)
+        calibration_y = self._labels(calibration_rows)
+        test_y = self._labels(test_rows)
+        if min(train_y.sum(), (train_y == 0).sum(), (calibration_y == 0).sum(), test_y.sum(), (test_y == 0).sum()) < 10:
+            raise LEAPSError(
+                "CROSS_TARGET_ML_CLASS_BALANCE",
+                "The saved trial tables do not contain enough balanced examples",
+                "Re-run the per-target ML validation with the recommended number of trials.",
+                ["Use at least 240 trials per split"],
+                stage=StageID.SECONDARY_ECLIPSE,
+            )
+        classifier = RandomForestClassifier(
+            n_estimators=500,
+            min_samples_leaf=4,
+            max_features=0.85,
+            class_weight="balanced",
+            random_state=random_seed,
+            n_jobs=-1,
+        )
+        classifier.fit(self._matrix(training_rows), train_y)
+        calibration_scores = classifier.predict_proba(self._matrix(calibration_rows))[:, 1]
+        threshold = float(np.max(calibration_scores[calibration_y == 0]))
+        test_scores = classifier.predict_proba(self._matrix(test_rows))[:, 1]
+        candidates = np.asarray(
+            [self._candidate(row, score, threshold) for row, score in zip(test_rows, test_scores, strict=True)],
+            dtype=bool,
+        )
+        rules = np.asarray([bool(int(row["leaps_candidate_rule"])) for row in test_rows], dtype=bool)
+        null = test_y == 0
+        rows = []
+        for row, score, candidate in zip(test_rows, test_scores, candidates, strict=True):
+            rows.append(
+                {
+                    "held_out_planet": held_out.planet,
+                    "injected_depth_ppm": float(row["injected_depth_ppm"]),
+                    "label_injected_eclipse": int(row["label_injected_eclipse"]),
+                    "example_type": row.get("example_type", ""),
+                    "leaps_candidate_rule": int(row["leaps_candidate_rule"]),
+                    "cross_target_score": float(score),
+                    "cross_target_candidate": int(candidate),
+                    **{key: float(row[key]) for key in FEATURE_KEYS},
+                }
+            )
+        curve = self._recovery_curve(rows)
+        return (
+            {
+                "planet": held_out.planet,
+                "source_trials": str(held_out.trial_path),
+                "training_planets": [case.planet for case in training_cases],
+                "threshold": threshold,
+                "roc_auc": float(roc_auc_score(test_y, test_scores)),
+                "ml_false_alarm_rate": float(np.mean(candidates[null])),
+                "fixed_rule_false_alarm_rate": float(np.mean(rules[null])),
+                "ml_recovery_50_ppm": self._recovery_floor(curve, "ml_recovery"),
+                "fixed_rule_recovery_50_ppm": self._recovery_floor(curve, "rule_recovery"),
+                "held_out_null_trials": int(null.sum()),
+                "held_out_positive_trials": int((~null).sum()),
+                "recovery_curve": curve,
+            },
+            rows,
+        )
+
+    @staticmethod
+    def _recovery_curve(rows: list[dict[str, Any]]) -> list[dict[str, float | int]]:
+        output: list[dict[str, float | int]] = []
+        for depth in sorted({float(row["injected_depth_ppm"]) for row in rows}):
+            selected = [row for row in rows if float(row["injected_depth_ppm"]) == depth]
+            output.append(
+                {
+                    "injected_depth_ppm": depth,
+                    "trials": len(selected),
+                    "ml_recovery": float(np.mean([int(row["cross_target_candidate"]) for row in selected])),
+                    "rule_recovery": float(np.mean([int(row["leaps_candidate_rule"]) for row in selected])),
+                }
+            )
+        return output
+
+    @staticmethod
+    def _recovery_floor(curve: list[dict[str, float | int]], key: str) -> float | None:
+        return SecondaryEclipseMLService._recovery_floor(curve, key)
+
+    def _summary_payload(
+        self,
+        cases: list[_CrossTargetTrials],
+        evaluations: list[dict[str, Any]],
+        rows: list[dict[str, Any]],
+        *,
+        random_seed: int,
+    ) -> dict[str, Any]:
+        from sklearn.metrics import roc_auc_score
+
+        labels = np.asarray([int(row["label_injected_eclipse"]) for row in rows], dtype=int)
+        scores = np.asarray([float(row["cross_target_score"]) for row in rows], dtype=float)
+        candidates = np.asarray([bool(int(row["cross_target_candidate"])) for row in rows], dtype=bool)
+        rules = np.asarray([bool(int(row["leaps_candidate_rule"])) for row in rows], dtype=bool)
+        null = labels == 0
+        zero_false_alarm_targets = sum(
+            float(entry["ml_false_alarm_rate"]) <= float(entry["fixed_rule_false_alarm_rate"])
+            for entry in evaluations
+        )
+        lower_floor_targets = sum(
+            entry["ml_recovery_50_ppm"] is not None
+            and entry["fixed_rule_recovery_50_ppm"] is not None
+            and float(entry["ml_recovery_50_ppm"]) + 10.0 < float(entry["fixed_rule_recovery_50_ppm"])
+            for entry in evaluations
+        )
+        universal_improvement = (
+            zero_false_alarm_targets == len(evaluations)
+            and lower_floor_targets >= max(2, math.ceil(len(evaluations) / 2))
+        )
+        if universal_improvement:
+            recommendation = (
+                "This frozen feature set is promising as a cross-target LEAPS triage aid: it improved recovery for "
+                "multiple previously unseen planets without exceeding the fixed-rule held-out false-alarm rate. "
+                "Keep the physical LEAPS outcome and independent checks as the authority."
+            )
+        else:
+            recommendation = (
+                "This leave-one-planet-out study did not establish a universal, zero-false-alarm improvement over "
+                "LEAPS' physics-first fixed-phase rule. Use the scores as a reliability experiment, not a detector."
+            )
+        aggregate_auc = float(roc_auc_score(labels, scores))
+        aggregate_fpr = float(np.mean(candidates[null]))
+        message = (
+            f"Leave-one-planet-out ROC-AUC {aggregate_auc:.2f}; aggregate ML false-alarm rate {aggregate_fpr:.1%}. "
+            f"{recommendation}"
+        )
+        return {
+            "analysis": "LEAPS secondary-eclipse leave-one-planet-out ML reliability validation",
+            "version": 1,
+            "feature_set": list(FEATURE_NAMES),
+            "classifier": "RandomForestClassifier (500 trees, min_samples_leaf=4)",
+            "random_seed": random_seed,
+            "input_planets": [case.planet for case in cases],
+            "input_trial_tables": [str(case.trial_path) for case in cases],
+            "aggregate_metrics": {
+                "roc_auc": aggregate_auc,
+                "ml_false_alarm_rate": aggregate_fpr,
+                "fixed_rule_false_alarm_rate": float(np.mean(rules[null])),
+                "held_out_null_trials": int(null.sum()),
+                "held_out_positive_trials": int((~null).sum()),
+                "targets_with_no_extra_false_alarms": int(zero_false_alarm_targets),
+                "targets_with_lower_50pct_recovery_floor": int(lower_floor_targets),
+            },
+            "per_target": evaluations,
+            "recommendation": recommendation,
+            "message": message,
+            "scientific_scope": [
+                "For each evaluation, neither the model nor its probability threshold sees any trial from the held-out planet.",
+                "All labels are known injection or null labels generated from LEAPS-cleaned real TESS residuals, not hand labels or claimed astronomical discoveries.",
+                "A score still requires LEAPS' positive-depth and nearby-control safety guard and never changes the normal LEAPS eclipse result.",
+                "This is a transferability test across the selected targets, not proof of performance for every star, passband, cadence, or form of astrophysical false positive.",
+            ],
+        }
+
+    @staticmethod
+    def _write_outputs(destination: Path, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "cross-target-summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        fields = [
+            "held_out_planet",
+            "injected_depth_ppm",
+            "label_injected_eclipse",
+            "example_type",
+            "leaps_candidate_rule",
+            "cross_target_score",
+            "cross_target_candidate",
+            *FEATURE_KEYS,
+        ]
+        with (destination / "cross-target-trials.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        CrossTargetSecondaryEclipseMLService._write_figure(
+            destination / "cross-target-validation.png", summary
+        )
+        (destination / "README.md").write_text(
+            "# LEAPS cross-target secondary-eclipse ML validation\n\n"
+            "Each row in this study is scored by a model that was trained and threshold-calibrated only on other "
+            "planets' TESS injection/recovery trials. This is stricter than a held-out-sector test. The study is a "
+            "reliability check, not an eclipse finder, and it never changes any standard LEAPS eclipse outcome.\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_figure(destination: Path, summary: dict[str, Any]) -> None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        entries = summary["per_target"]
+        planets = [str(entry["planet"]) for entry in entries]
+        x = np.arange(len(entries))
+        auc = np.asarray([float(entry["roc_auc"]) for entry in entries], dtype=float)
+        ml_fpr = np.asarray([float(entry["ml_false_alarm_rate"]) for entry in entries], dtype=float)
+        rule_fpr = np.asarray(
+            [float(entry["fixed_rule_false_alarm_rate"]) for entry in entries], dtype=float
+        )
+        ml_floor = np.asarray(
+            [
+                np.nan if entry["ml_recovery_50_ppm"] is None else float(entry["ml_recovery_50_ppm"])
+                for entry in entries
+            ],
+            dtype=float,
+        )
+        rule_floor = np.asarray(
+            [
+                np.nan
+                if entry["fixed_rule_recovery_50_ppm"] is None
+                else float(entry["fixed_rule_recovery_50_ppm"])
+                for entry in entries
+            ],
+            dtype=float,
+        )
+        figure = Figure(figsize=(12.0, 7.5), facecolor="#0b2638", constrained_layout=True)
+        FigureCanvasAgg(figure)
+        grid = figure.add_gridspec(3, 2, height_ratios=(0.27, 1.0, 1.0))
+        header = figure.add_subplot(grid[0, :])
+        header.axis("off")
+        header.text(
+            0.0,
+            0.88,
+            "LEAPS  ·  leave-one-planet-out ML reliability test",
+            color="#f7fbff",
+            fontsize=19,
+            fontweight="bold",
+            va="top",
+        )
+        metrics = summary["aggregate_metrics"]
+        header.text(
+            0.0,
+            0.23,
+            f"{len(entries)} targets  ·  aggregate ROC-AUC {metrics['roc_auc']:.2f}  ·  ML false alarms "
+            f"{metrics['ml_false_alarm_rate']:.1%}  ·  each model was trained/calibrated on other planets only",
+            color="#b8c8d6",
+            fontsize=10.5,
+            va="top",
+        )
+        colors = {"ml": "#25c2c7", "rule": "#f1bd50", "bar": "#4d9dcc"}
+        auc_axis = figure.add_subplot(grid[1, 0])
+        auc_axis.set_facecolor("#102f43")
+        auc_axis.bar(x, auc, color=colors["bar"])
+        auc_axis.axhline(0.5, color="#93a6b4", ls="--", lw=1.0)
+        auc_axis.set_ylim(0.45, 1.03)
+        auc_axis.set_xticks(x, planets, rotation=20, ha="right")
+        auc_axis.set_ylabel("Held-out ROC-AUC", color="#d6e2ea")
+        auc_axis.set_title("Transfer to an unseen planet", color="#f7fbff", loc="left", fontweight="bold")
+
+        fpr_axis = figure.add_subplot(grid[1, 1])
+        fpr_axis.set_facecolor("#102f43")
+        width = 0.34
+        fpr_axis.bar(x - width / 2, 100.0 * rule_fpr, width, color=colors["rule"], label="LEAPS fixed rule")
+        fpr_axis.bar(x + width / 2, 100.0 * ml_fpr, width, color=colors["ml"], label="ML + safety guard")
+        fpr_axis.set_xticks(x, planets, rotation=20, ha="right")
+        fpr_axis.set_ylabel("Held-out false alarms (%)", color="#d6e2ea")
+        fpr_axis.set_title("False-alarm control", color="#f7fbff", loc="left", fontweight="bold")
+        legend = fpr_axis.legend(frameon=False)
+        for text in legend.get_texts():
+            text.set_color("#e6f0f6")
+
+        floor_axis = figure.add_subplot(grid[2, 0])
+        floor_axis.set_facecolor("#102f43")
+        floor_axis.plot(x, rule_floor, "o", color=colors["rule"], ms=8, label="LEAPS fixed rule")
+        floor_axis.plot(x, ml_floor, "o", color=colors["ml"], ms=8, label="ML + safety guard")
+        floor_axis.set_xticks(x, planets, rotation=20, ha="right")
+        floor_axis.set_ylabel("50% recovery depth (ppm)", color="#d6e2ea")
+        floor_axis.set_title("Injection recovery", color="#f7fbff", loc="left", fontweight="bold")
+        floor_legend = floor_axis.legend(frameon=False)
+        for text in floor_legend.get_texts():
+            text.set_color("#e6f0f6")
+
+        scope_axis = figure.add_subplot(grid[2, 1])
+        scope_axis.set_facecolor("#102f43")
+        scope_axis.axis("off")
+        scope_axis.text(
+            0.04,
+            0.9,
+            "How to read this",
+            color="#f7fbff",
+            fontsize=13,
+            fontweight="bold",
+            va="top",
+        )
+        scope_axis.text(
+            0.04,
+            0.72,
+            "A model scores each planet without seeing any of that planet's injection trials. "
+            "A lower recovery floor matters only if false alarms do not increase.\n\n"
+            + str(summary["recommendation"]),
+            color="#c7d5df",
+            fontsize=9.5,
+            va="top",
+            wrap=True,
+        )
+        for axis in (auc_axis, fpr_axis, floor_axis):
+            axis.tick_params(colors="#c7d5df")
+            for spine in axis.spines.values():
+                spine.set_color("#49667a")
         destination.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(destination, dpi=180, facecolor=figure.get_facecolor())

@@ -57,7 +57,7 @@ from leaps.science import (
     ReductionService,
     SecondaryEclipseService,
 )
-from leaps.secondary_ml import SecondaryEclipseMLService
+from leaps.secondary_ml import CrossTargetSecondaryEclipseMLService, SecondaryEclipseMLService
 from leaps.targets import ResolvedTarget, TargetNameResolver
 from leaps.tess import TessImportResult, TessImportService
 
@@ -457,9 +457,15 @@ class MainWindow(QMainWindow):
         )
         self.secondary_eclipse_page.analyzeRequested.connect(self.run_secondary_eclipse)
         self.secondary_eclipse_page.mlValidationRequested.connect(self.run_secondary_eclipse_ml)
+        self.secondary_eclipse_page.crossTargetValidationRequested.connect(
+            self.choose_cross_target_validation_trials
+        )
         self.secondary_eclipse_page.cancelRequested.connect(self.cancel_secondary_eclipse)
         self.secondary_eclipse_page.viewInFilesRequested.connect(self.view_secondary_eclipse_in_files)
         self.secondary_eclipse_page.viewMLInFilesRequested.connect(self.view_secondary_eclipse_ml_in_files)
+        self.secondary_eclipse_page.viewCrossTargetInFilesRequested.connect(
+            self.view_cross_target_validation_in_files
+        )
         self.reports_page.openFolderRequested.connect(self.open_outputs_folder)
         self.reports_page.exportExoClockRequested.connect(lambda: self.export_transit("exoclock"))
         self.reports_page.exportETDRequested.connect(lambda: self.export_transit("etd"))
@@ -1815,6 +1821,12 @@ class MainWindow(QMainWindow):
         )
         ml_available, ml_message = SecondaryEclipseMLService.availability(project)
         self.secondary_eclipse_page.set_ml_context(ml_available, ml_message)
+        cross_target_available, cross_target_message = CrossTargetSecondaryEclipseMLService.availability(
+            project
+        )
+        self.secondary_eclipse_page.set_cross_target_context(
+            cross_target_available, cross_target_message
+        )
         result_path = project.outputs_dir / StageID.SECONDARY_ECLIPSE.value / "secondary-eclipse.json"
         preview_path = result_path.with_name("secondary-eclipse.png")
         eclipse_summary: dict[str, Any] | None = None
@@ -1843,6 +1855,22 @@ class MainWindow(QMainWindow):
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 self.secondary_eclipse_page.show_ml_failure(
                     "A previous ML validation could not be read. Run the recovery check again if needed."
+                )
+        cross_target_summary_path = (
+            project.outputs_dir
+            / CrossTargetSecondaryEclipseMLService.OUTPUT_NAME
+            / "cross-target-summary.json"
+        )
+        cross_target_preview_path = cross_target_summary_path.with_name("cross-target-validation.png")
+        if cross_target_summary_path.exists():
+            try:
+                self.secondary_eclipse_page.show_saved_cross_target_result(
+                    json.loads(cross_target_summary_path.read_text(encoding="utf-8")),
+                    cross_target_preview_path,
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self.secondary_eclipse_page.show_cross_target_failure(
+                    "A previous cross-target study could not be read. Run it again if needed."
                 )
 
     def run_secondary_eclipse(self, values: dict[str, Any]) -> None:
@@ -2055,6 +2083,102 @@ class MainWindow(QMainWindow):
             self.status_text.setText("ML validation cancelled")
             return
         self.secondary_eclipse_page.show_ml_failure(f"{failure.title}: {failure.message}")
+        self._show_failure(failure)
+
+    def choose_cross_target_validation_trials(self) -> None:
+        if not self.project:
+            self._handle_error(
+                LEAPSError(
+                    "PROJECT_REQUIRED",
+                    "Open a project first",
+                    "A saved per-target ML validation is needed before a cross-target reliability study can run.",
+                    ["Open a TESS project", "Run the ML recovery check"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        project = self.project
+        available, availability_message = CrossTargetSecondaryEclipseMLService.availability(project)
+        if not available:
+            self._handle_error(
+                LEAPSError(
+                    "CROSS_TARGET_ML_UNAVAILABLE",
+                    "Cross-target validation is not ready",
+                    availability_message,
+                    ["Run the current target's ML recovery check", "Then choose two other target trial tables"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        current_folder = project.outputs_dir / SecondaryEclipseMLService.OUTPUT_NAME
+        selected, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose ML trial tables from at least two other planets",
+            str(current_folder),
+            "LEAPS ML trial tables (ml-trials.csv);;CSV files (*.csv)",
+        )
+        if not selected:
+            return
+        self.run_cross_target_validation([Path(path) for path in selected])
+
+    def run_cross_target_validation(self, trial_paths: list[Path]) -> None:
+        if not self.project:
+            return
+        project = self.project
+        if not self.secondary_eclipse_page.has_valid_result:
+            self._handle_error(
+                LEAPSError(
+                    "SECONDARY_ECLIPSE_RESULT_REQUIRED",
+                    "Analyse the eclipse first",
+                    "The cross-target study needs a saved current eclipse and ML validation setup.",
+                    ["Click Analyse Eclipse", "Run the ML recovery check"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                )
+            )
+            return
+        if not self._ensure_runner_idle("run the cross-target reliability study", StageID.SECONDARY_ECLIPSE):
+            return
+
+        def validate(*, emit=None, token=None):
+            return CrossTargetSecondaryEclipseMLService().run(
+                project,
+                trial_paths,
+                emit=emit,
+                token=token,
+            )
+
+        self.secondary_eclipse_page.set_cross_target_busy(True)
+        self.status_dot.setStyleSheet(f"color: {COLORS['cyan']};")
+        self.status_text.setText("Running leave-one-planet-out ML reliability study…")
+        self.runner.start(
+            validate,
+            event=self._cross_target_ml_event,
+            result=self._cross_target_ml_complete,
+            error=self._cross_target_ml_failed,
+            finished=lambda: self.secondary_eclipse_page.set_cross_target_busy(False),
+            operation="cross-target secondary-eclipse ML validation",
+        )
+
+    def _cross_target_ml_event(self, event: StageEvent) -> None:
+        self.secondary_eclipse_page.update_cross_target_event(event)
+        self.status_text.setText(event.message)
+
+    def _cross_target_ml_complete(self, result: Any) -> None:
+        self.secondary_eclipse_page.show_cross_target_result(result)
+        self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+        self.status_text.setText("Leave-one-planet-out reliability study complete")
+        self.autosave.setText("autosaved just now")
+
+    def _cross_target_ml_failed(self, exc: BaseException) -> None:
+        failure = self._as_failure(exc, StageID.SECONDARY_ECLIPSE)
+        if failure.code == "JOB_CANCELLED":
+            self.secondary_eclipse_page.show_cross_target_failure(
+                "Cross-target validation cancelled. Existing eclipse and ML validation results were preserved."
+            )
+            self.status_dot.setStyleSheet(f"color: {COLORS['green']};")
+            self.status_text.setText("Cross-target validation cancelled")
+            return
+        self.secondary_eclipse_page.show_cross_target_failure(f"{failure.title}: {failure.message}")
         self._show_failure(failure)
 
     def _secondary_eclipse_complete(self, result: SecondaryEclipseService.Result) -> None:
@@ -2335,6 +2459,34 @@ class MainWindow(QMainWindow):
                     "The ML validation plot could not be shown in files",
                     "LEAPS could not open the system file manager.",
                     ["Open the LEAPS secondary_eclipse_ml output folder manually"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=f"{preview}\n{exc}",
+                )
+            )
+
+    def view_cross_target_validation_in_files(self, path: Path) -> None:
+        preview = Path(path)
+        if not preview.is_file():
+            self._handle_error(
+                LEAPSError(
+                    "CROSS_TARGET_ML_PREVIEW_MISSING",
+                    "The cross-target validation plot is no longer available",
+                    "The output may have been moved or replaced since it was displayed.",
+                    ["Run the cross-target study again"],
+                    stage=StageID.SECONDARY_ECLIPSE,
+                    technical_details=str(preview),
+                )
+            )
+            return
+        try:
+            _reveal_in_file_manager(preview)
+        except OSError as exc:
+            self._handle_error(
+                LEAPSError(
+                    "CROSS_TARGET_ML_REVEAL_FAILED",
+                    "The cross-target validation plot could not be shown in files",
+                    "LEAPS could not open the system file manager.",
+                    ["Open the LEAPS secondary_eclipse_cross_target_ml output folder manually"],
                     stage=StageID.SECONDARY_ECLIPSE,
                     technical_details=f"{preview}\n{exc}",
                 )

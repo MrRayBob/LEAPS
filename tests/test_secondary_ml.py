@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +13,13 @@ from leaps.catalog import PlanetParameters
 from leaps.models import StageID
 from leaps.project import ProjectWorkspace
 from leaps.science import SecondaryEclipseService
-from leaps.secondary_ml import SecondaryEclipseMLService, _FixedPhaseEvaluator
+from leaps.secondary_ml import (
+    FEATURE_KEYS,
+    FEATURE_NAMES,
+    CrossTargetSecondaryEclipseMLService,
+    SecondaryEclipseMLService,
+    _FixedPhaseEvaluator,
+)
 
 
 def _parameters() -> PlanetParameters:
@@ -133,10 +141,108 @@ def test_ml_validation_uses_disjoint_tess_segments_and_writes_outputs(tmp_path: 
     assert result.raw["analysis"].startswith("LEAPS secondary-eclipse")
     assert "Positive-depth sector fraction" in result.raw["configuration"]["features"]
     assert "Inter-sector depth scatter" in result.raw["configuration"]["features"]
-
-    import csv
+    assert "Baseline-to-baseline depth shift" in result.raw["configuration"]["features"]
+    assert "Positive depth under both baselines" in result.raw["configuration"]["features"]
 
     with (result.output_path / "ml-trials.csv").open(newline="", encoding="utf-8") as handle:
         first_row = next(csv.DictReader(handle))
     assert 0.0 <= float(first_row["positive_sector_fraction"]) <= 1.0
     assert float(first_row["sector_depth_scatter"]) >= 0.0
+    assert float(first_row["detrending_depth_shift"]) >= 0.0
+    assert float(first_row["detrending_positive_agreement"]) in {0.0, 1.0}
+
+
+def _write_cross_target_trials(path: Path, planet: str, offset: float) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    trial_path = path / "ml-trials.csv"
+    fieldnames = [
+        "split",
+        "injected_depth_ppm",
+        "label_injected_eclipse",
+        "example_type",
+        "leaps_candidate_rule",
+        *FEATURE_KEYS,
+    ]
+    rows: list[dict[str, float | int | str]] = []
+    for split in ("train", "calibration", "test"):
+        for index in range(20):
+            rows.append(
+                {
+                    "split": split,
+                    "injected_depth_ppm": 0.0,
+                    "label_injected_eclipse": 0,
+                    "example_type": "clean_null",
+                    "leaps_candidate_rule": 0,
+                    "depth_ppm": -8.0 + offset + index * 0.1,
+                    "depth_uncertainty_ppm": 26.0 + offset,
+                    "significance": -0.3 + index * 0.01,
+                    "red_noise_beta": 1.4,
+                    "residual_rms_ppm": 600.0 + offset,
+                    "delta_chi_squared": 1.0 + index * 0.1,
+                    "control_significance": 0.8,
+                    "positive_sector_fraction": 0.35,
+                    "sector_depth_scatter": 1.6,
+                    "detrending_depth_shift": 1.2,
+                    "detrending_positive_agreement": 0,
+                }
+            )
+            rows.append(
+                {
+                    "split": split,
+                    "injected_depth_ppm": 180.0,
+                    "label_injected_eclipse": 1,
+                    "example_type": "expected_eclipse",
+                    "leaps_candidate_rule": 1,
+                    "depth_ppm": 170.0 + offset + index * 0.1,
+                    "depth_uncertainty_ppm": 26.0 + offset,
+                    "significance": 6.2 + index * 0.01,
+                    "red_noise_beta": 1.4,
+                    "residual_rms_ppm": 600.0 + offset,
+                    "delta_chi_squared": 42.0 + index * 0.1,
+                    "control_significance": 0.8,
+                    "positive_sector_fraction": 1.0,
+                    "sector_depth_scatter": 0.8,
+                    "detrending_depth_shift": 0.3,
+                    "detrending_positive_agreement": 1,
+                }
+            )
+    with trial_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    (path / "ml-summary.json").write_text(
+        json.dumps({"planet": planet, "configuration": {"features": list(FEATURE_NAMES)}}),
+        encoding="utf-8",
+    )
+    return trial_path
+
+
+def test_cross_target_validation_never_trains_on_the_held_out_planet(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    project = ProjectWorkspace.create(tmp_path / "owner", "Owner target")
+    owner_trials = _write_cross_target_trials(
+        project.outputs_dir / SecondaryEclipseMLService.OUTPUT_NAME,
+        "Target A b",
+        0.0,
+    )
+    other_trials = [
+        _write_cross_target_trials(tmp_path / "target-b", "Target B b", 10.0),
+        _write_cross_target_trials(tmp_path / "target-c", "Target C b", 20.0),
+    ]
+
+    events = []
+    result = CrossTargetSecondaryEclipseMLService().run(
+        project,
+        [owner_trials, *other_trials],
+        emit=events.append,
+    )
+
+    assert result.preview_path.exists()
+    assert result.summary_path.exists()
+    assert (result.output_path / "cross-target-trials.csv").exists()
+    assert result.target_count == 3
+    assert 0.0 <= result.aggregate_auc <= 1.0
+    assert all(event.current <= event.total for event in events)
+    assert events[-1].current == events[-1].total == 7
+    for entry in result.raw["per_target"]:
+        assert entry["planet"] not in entry["training_planets"]

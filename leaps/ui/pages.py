@@ -2111,20 +2111,26 @@ class FittingPage(QWidget):
 class SecondaryEclipsePage(QWidget):
     analyzeRequested = Signal(dict)
     mlValidationRequested = Signal(dict)
+    crossTargetValidationRequested = Signal()
     cancelRequested = Signal()
     viewInFilesRequested = Signal(object)
     viewMLInFilesRequested = Signal(object)
+    viewCrossTargetInFilesRequested = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._parameters: PlanetParameters | None = None
         self._busy = False
         self._ml_busy = False
+        self._cross_target_busy = False
         self._result_valid = False
         self._ml_available = False
         self._ml_result_valid = False
+        self._cross_target_available = False
+        self._cross_target_result_valid = False
         self._preview_path: Path | None = None
         self._ml_preview_path: Path | None = None
+        self._cross_target_preview_path: Path | None = None
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
 
@@ -2301,6 +2307,57 @@ class SecondaryEclipsePage(QWidget):
         ml_actions.addWidget(self.view_ml_in_files)
         ml_layout.addLayout(ml_actions)
         setup_layout.addWidget(ml_card)
+
+        cross_target_card = QFrame()
+        cross_target_card.setObjectName("eclipseContextCard")
+        cross_target_card.setStyleSheet(
+            f"QFrame#eclipseContextCard {{ background: {COLORS['canvas']}; border: 1px solid {COLORS['border']}; border-radius: 7px; }}"
+        )
+        cross_target_layout = QVBoxLayout(cross_target_card)
+        cross_target_layout.setContentsMargins(12, 11, 12, 11)
+        cross_target_layout.setSpacing(6)
+        cross_target_heading = QHBoxLayout()
+        cross_target_title = QLabel("Cross-target reliability study")
+        cross_target_title.setObjectName("eyebrow")
+        cross_target_heading.addWidget(cross_target_title)
+        cross_target_heading.addWidget(
+            InfoButton(
+                "This is stricter than the target's normal ML recovery check. Choose at least two other "
+                "compatible ml-trials.csv files. For each planet, LEAPS trains and sets its score threshold "
+                "only from the other planets, then tests that completely unseen target."
+            )
+        )
+        cross_target_heading.addStretch()
+        cross_target_layout.addLayout(cross_target_heading)
+        self.cross_target_context = QLabel(
+            "Run this target's ML recovery check first. Then use two or more compatible target trial tables."
+        )
+        self.cross_target_context.setObjectName("muted")
+        self.cross_target_context.setWordWrap(True)
+        cross_target_layout.addWidget(self.cross_target_context)
+        self.run_cross_target = ActionButton(
+            "Run cross-target study",
+            "fa6s.network-wired",
+            tooltip="Choose ML trial tables from at least two other planets and run a leave-one-planet-out reliability test.",
+        )
+        self.run_cross_target.clicked.connect(self.crossTargetValidationRequested)
+        cross_target_layout.addWidget(self.run_cross_target)
+        self.cross_target_summary = QLabel("No cross-target reliability study has been run.")
+        self.cross_target_summary.setObjectName("muted")
+        self.cross_target_summary.setWordWrap(True)
+        cross_target_layout.addWidget(self.cross_target_summary)
+        cross_target_actions = QHBoxLayout()
+        cross_target_actions.addStretch()
+        self.view_cross_target_in_files = ActionButton(
+            "View cross-target results",
+            "fa6s.folder-open",
+            tooltip="Reveal the leave-one-planet-out plot, CSV trial table, and reproducibility summary.",
+        )
+        self.view_cross_target_in_files.setEnabled(False)
+        self.view_cross_target_in_files.clicked.connect(self._request_cross_target_view_in_files)
+        cross_target_actions.addWidget(self.view_cross_target_in_files)
+        cross_target_layout.addLayout(cross_target_actions)
+        setup_layout.addWidget(cross_target_card)
         setup_layout.addStretch()
         buttons = QHBoxLayout()
         self.cancel = ActionButton(
@@ -2422,11 +2479,15 @@ class SecondaryEclipsePage(QWidget):
         self._parameters = None
         self._busy = False
         self._ml_busy = False
+        self._cross_target_busy = False
         self._result_valid = False
         self._ml_available = False
         self._ml_result_valid = False
+        self._cross_target_available = False
+        self._cross_target_result_valid = False
         self._preview_path = None
         self._ml_preview_path = None
+        self._cross_target_preview_path = None
         self._preview_pixmap = QPixmap()
         self._rendered_preview_pixmap = QPixmap()
         for control, value in (
@@ -2452,6 +2513,11 @@ class SecondaryEclipsePage(QWidget):
         )
         self.ml_summary.setText("No ML validation has been run for this eclipse setup.")
         self.view_ml_in_files.setEnabled(False)
+        self.cross_target_context.setText(
+            "Run this target's ML recovery check first. Then use two or more compatible target trial tables."
+        )
+        self.cross_target_summary.setText("No cross-target reliability study has been run.")
+        self.view_cross_target_in_files.setEnabled(False)
         self._set_outcome("waiting", "Waiting for full fit")
         self._set_metrics()
         self._refresh_actions()
@@ -2489,6 +2555,11 @@ class SecondaryEclipsePage(QWidget):
         self.ml_context.setText(message)
         self._refresh_actions()
 
+    def set_cross_target_context(self, available: bool, message: str) -> None:
+        self._cross_target_available = available
+        self.cross_target_context.setText(message)
+        self._refresh_actions()
+
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.analyze.set_running(busy, "Analysing Eclipse…")
@@ -2499,8 +2570,14 @@ class SecondaryEclipsePage(QWidget):
             self._ml_result_valid = False
             self._ml_preview_path = None
             self.view_ml_in_files.setEnabled(False)
+            self._cross_target_result_valid = False
+            self._cross_target_preview_path = None
+            self.view_cross_target_in_files.setEnabled(False)
             self.ml_summary.setText(
                 "The eclipse fit is being refreshed. Run the ML recovery check again after the new result is saved."
+            )
+            self.cross_target_summary.setText(
+                "The eclipse fit is being refreshed. Run target and cross-target validation again after it is saved."
             )
             self.progress.setRange(0, 0)
             self.message.setText("Preparing the fixed-phase eclipse model and control checks…")
@@ -2517,10 +2594,25 @@ class SecondaryEclipsePage(QWidget):
             )
         self._refresh_actions()
 
+    def set_cross_target_busy(self, busy: bool) -> None:
+        self._cross_target_busy = busy
+        self.run_cross_target.set_running(busy, "Running cross-target study…")
+        self._refresh_cancel()
+        if busy:
+            self.cross_target_summary.setText(
+                "Training on other planets and testing each target without using any of its own trials. "
+                "Normal LEAPS eclipse results stay unchanged."
+            )
+        self._refresh_actions()
+
     def set_stopping(self) -> None:
         self.cancel.setText("Stopping…")
         self.cancel.setEnabled(False)
-        if self._ml_busy:
+        if self._cross_target_busy:
+            self.cross_target_summary.setText(
+                "Stopping safely and preserving earlier eclipse, ML, and cross-target results…"
+            )
+        elif self._ml_busy:
             self.ml_summary.setText(
                 "Stopping safely and preserving both the normal eclipse result and any prior ML validation…"
             )
@@ -2542,6 +2634,9 @@ class SecondaryEclipsePage(QWidget):
 
     def update_ml_event(self, event: StageEvent) -> None:
         self.ml_summary.setText(event.message + "…")
+
+    def update_cross_target_event(self, event: StageEvent) -> None:
+        self.cross_target_summary.setText(event.message + "…")
 
     def show_result(self, result: Any) -> None:
         self._preview_path = Path(result.preview_path)
@@ -2642,15 +2737,49 @@ class SecondaryEclipsePage(QWidget):
         self.ml_summary.setText(metrics_text + " " + str(summary.get("recommendation", "")))
         self._refresh_actions()
 
+    def show_cross_target_result(self, result: Any) -> None:
+        self._cross_target_preview_path = Path(result.preview_path)
+        self._cross_target_result_valid = self._cross_target_preview_path.is_file()
+        self.view_cross_target_in_files.setEnabled(self._cross_target_result_valid)
+        self.cross_target_summary.setText(
+            f"{result.target_count} targets · leave-one-planet-out ROC-AUC {result.aggregate_auc:.2f} · "
+            f"ML false alarms {result.aggregate_false_alarm_rate:.1%}. {result.recommendation}"
+        )
+        self._refresh_actions()
+
+    def show_saved_cross_target_result(self, summary: dict[str, Any], preview_path: Path) -> None:
+        metrics = summary.get("aggregate_metrics", {})
+        self._cross_target_preview_path = Path(preview_path)
+        self._cross_target_result_valid = self._cross_target_preview_path.is_file()
+        self.view_cross_target_in_files.setEnabled(self._cross_target_result_valid)
+        auc = _optional_float(metrics.get("roc_auc"))
+        fpr = _optional_float(metrics.get("ml_false_alarm_rate"))
+        targets = summary.get("input_planets", [])
+        intro = "Saved cross-target study is available."
+        if auc is not None and fpr is not None:
+            intro = f"{len(targets)} targets · leave-one-planet-out ROC-AUC {auc:.2f} · ML false alarms {fpr:.1%}."
+        self.cross_target_summary.setText(intro + " " + str(summary.get("recommendation", "")))
+        self._refresh_actions()
+
     def show_ml_failure(self, message: str) -> None:
         self.ml_summary.setText(message)
+        self._refresh_actions()
+
+    def show_cross_target_failure(self, message: str) -> None:
+        self.cross_target_summary.setText(message)
         self._refresh_actions()
 
     def show_ml_stale(self, message: str) -> None:
         self._ml_result_valid = False
         self._ml_preview_path = None
         self.view_ml_in_files.setEnabled(False)
+        self._cross_target_result_valid = False
+        self._cross_target_preview_path = None
+        self.view_cross_target_in_files.setEnabled(False)
         self.ml_summary.setText(message)
+        self.cross_target_summary.setText(
+            "The current target's ML trials are stale, so its cross-target study is not available."
+        )
         self._refresh_actions()
 
     def show_failure(self, message: str) -> None:
@@ -2659,6 +2788,8 @@ class SecondaryEclipsePage(QWidget):
         self._result_valid = False
         self._ml_result_valid = False
         self.view_ml_in_files.setEnabled(False)
+        self._cross_target_result_valid = False
+        self.view_cross_target_in_files.setEnabled(False)
         self._refresh_actions()
 
     def show_cancelled(self, message: str) -> None:
@@ -2676,15 +2807,22 @@ class SecondaryEclipsePage(QWidget):
         self._ml_result_valid = False
         self._ml_preview_path = None
         self.view_ml_in_files.setEnabled(False)
+        self._cross_target_result_valid = False
+        self._cross_target_preview_path = None
+        self.view_cross_target_in_files.setEnabled(False)
         if self._ml_available:
             self.ml_summary.setText(
                 "Eclipse settings changed. Analyse Eclipse again before running or interpreting an ML recovery check."
+            )
+        if self._cross_target_available:
+            self.cross_target_summary.setText(
+                "Eclipse settings changed. Regenerate this target's ML trials before interpreting a cross-target study."
             )
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
         self.analyze.set_primary(True)
-        busy = self._busy or self._ml_busy
+        busy = self._busy or self._ml_busy or self._cross_target_busy
         self.analyze.setEnabled(self._parameters is not None and not busy)
         self.run_ml.setEnabled(
             self._parameters is not None
@@ -2692,9 +2830,16 @@ class SecondaryEclipsePage(QWidget):
             and self._ml_available
             and not busy
         )
+        self.run_cross_target.setEnabled(
+            self._parameters is not None
+            and self._result_valid
+            and self._ml_result_valid
+            and self._cross_target_available
+            and not busy
+        )
 
     def _refresh_cancel(self) -> None:
-        busy = self._busy or self._ml_busy
+        busy = self._busy or self._ml_busy or self._cross_target_busy
         self.cancel.set_cancel_active(busy)
         self.cancel.setEnabled(busy)
         self.cancel.setText("Cancel")
@@ -2802,6 +2947,10 @@ class SecondaryEclipsePage(QWidget):
     def _request_ml_view_in_files(self) -> None:
         if self._ml_preview_path and self._ml_preview_path.is_file():
             self.viewMLInFilesRequested.emit(self._ml_preview_path)
+
+    def _request_cross_target_view_in_files(self) -> None:
+        if self._cross_target_preview_path and self._cross_target_preview_path.is_file():
+            self.viewCrossTargetInFilesRequested.emit(self._cross_target_preview_path)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

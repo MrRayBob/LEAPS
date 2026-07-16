@@ -202,7 +202,9 @@ def test_secondary_eclipse_ml_check_is_explicitly_gated_by_a_saved_result(qapp, 
         )
     )
     page.set_ml_context(True, "Uses held-out TESS sectors; it never changes the LEAPS eclipse decision.")
+    page.set_cross_target_context(True, "Use this target plus two other saved ML trial tables.")
     assert not page.run_ml.isEnabled()
+    assert not page.run_cross_target.isEnabled()
 
     preview = tmp_path / "secondary-eclipse.png"
     Image.new("RGB", (800, 500), "#0b2638").save(preview)
@@ -226,6 +228,20 @@ def test_secondary_eclipse_ml_check_is_explicitly_gated_by_a_saved_result(qapp, 
     )
 
     assert page.run_ml.isEnabled()
+    ml_preview = tmp_path / "ml-validation.png"
+    Image.new("RGB", (800, 500), "#0b2638").save(ml_preview)
+    page.show_saved_ml_result(
+        {
+            "metrics": {
+                "test_roc_auc": 0.94,
+                "test_ml_false_alarm_rate": 0.0,
+                "calibration_false_alarm_target": 0.0,
+            },
+            "recommendation": "Validation only.",
+        },
+        ml_preview,
+    )
+    assert page.run_cross_target.isEnabled()
     assert page.values()["ml_trials_per_split"] == 240
     page.close()
 
