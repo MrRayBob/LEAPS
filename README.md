@@ -1,85 +1,30 @@
 # LEAPS
 
-LEAPS is a friendly desktop workflow for reducing and analysing exoplanet-transit FITS sequences. It preserves the established HOPS scientific routines while replacing the complete Tkinter interface with a single, stable PySide6 application.
+LEAPS is a desktop application for reducing and analyzing exoplanet-transit observations. Visit www.leaps.software for more information.
 
-The first release focuses on reliability and approachability:
+## Download
 
-- one resizable window for Data & Target, Reduction, Inspection, Alignment, Photometry, Light Curve, Fitting, and Secondary Eclipse;
-- coordinates as the canonical target identity, with target name optional;
-- HOPS-style target-name lookup through ExoClock/SIMBAD, with offline NASA and reusable cache fallbacks;
-- automatic FITS frame classification with explicit calibration waivers;
-- background processing, safe cancellation, checkpoints, and continuous project autosave;
-- real reduced-FITS viewing with working pan, zoom, invert, reset, and target/comparison overlays;
-- optional plate solving that validates an existing FITS WCS first, then uses bounded Gaia attempts with a visible timeline and manual target placement fallback;
-- the original HOPS star detection, Gaussian fitting, geometric-centering option, variable aperture, sky-annulus, and differential-photometry calculations behind the new interface;
-- a required Light Curve review where anomalous comparison stars can be excluded before HOPS-compatible fitting and export;
-- target-coordinate-driven planet defaults, automatic HOPS passband/exposure detection, a rendered Preview Fit gate, and transactional full-fit outputs;
-- a fixed-phase secondary-eclipse (occultation) workflow that reuses the completed fit, reports red-noise-aware uncertainty and nearby control-phase checks, and clearly distinguishes candidate, marginal, and inconclusive results;
-- typed, recoverable failures and one-click redacted diagnostic ZIP export;
-- offline-data management with size estimates, disk checks, resumable downloads, and project-region Gaia packages;
-- familiar HOPS-compatible outputs plus ExoClock and ETD export surfaces;
-- a signed Apple-Silicon DMG and signed Windows 10/11 x64 installer build pipeline.
+Download the latest version from **[GitHub Releases](https://github.com/araysuter/LEAPS/releases)**.
 
-## Run from source
+LEAPS is available for:
 
-LEAPS supports Python 3.11–3.14.
+- macOS on Apple Silicon Macs
+- Windows 10 and Windows 11 on 64-bit PCs
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-python -m leaps
-```
+## Install on macOS
 
-On Windows, activate the environment with `.venv\Scripts\activate` before running the same install and launch commands.
+1. Download the macOS `.dmg` file from [GitHub Releases](https://github.com/araysuter/LEAPS/releases).
+2. Open the downloaded `.dmg` file.
+3. Drag **LEAPS** into the **Applications** folder.
+4. Try to open LEAPS from Applications.
+5. If macOS blocks the app, open **System Settings → Privacy & Security**.
+6. Scroll to the Security section, click **Open Anyway** beside the LEAPS message, and confirm **Open**.
 
-Raw FITS files are opened read-only. LEAPS creates a visible, portable `LEAPS/` folder inside the observing run containing `project.json`, structured logs, caches, checkpoints, and generated outputs. Moving the run folder between macOS and Windows preserves relative project references. Existing hidden `.leaps/` projects are validated and migrated automatically when opened. Data & Target can reveal this folder or safely reset only LEAPS-generated data after exact-name confirmation.
+## Install on Windows
 
-To resume an existing run, use **Data & Target → Open project** and choose the observing-run folder containing `LEAPS/project.json` (or the `LEAPS` folder itself). LEAPS restores the saved workflow state without rescanning or changing raw FITS files.
+1. Download the Windows installer from [GitHub Releases](https://github.com/araysuter/LEAPS/releases).
+2. Open the downloaded `LEAPS-Windows-x64-Setup.exe` file.
+3. Follow the setup instructions.
+4. Launch LEAPS from the Start menu or desktop shortcut.
 
-## TESS light-curve import
-
-Use **Data & Target → Import TESS light curves** to select one or more downloaded TESS SPOC `*_lc.fits` products for a single TIC target. LEAPS reads their calibrated `PDCSAP_FLUX` values and mission quality flags without changing the source files, creates a portable `TESS-TIC-<id>/LEAPS/` project beside the selected data, and opens **Fitting**.
-
-The primary-transit fit is catalog-guided: LEAPS refines the known ephemeris with Box Least Squares, phase-folds the many TESS epochs into one HOPS-compatible transit fit, and then enables **Secondary Eclipse** after a completed full fit. TESS target-pixel files and full-frame images are deliberately not accepted here; they require a separate photometric-extraction workflow before fitting.
-
-## Secondary eclipse analysis
-
-Run a full primary-transit fit first, then open **Secondary Eclipse**. LEAPS carries forward the saved ephemeris and approved aperture/PSF light curve, suggests a duration from the transit geometry, and evaluates only the expected occultation phase (normally 0.50 for a circular orbit). It also fits nearby control phases and scales the depth uncertainty for time-correlated noise.
-
-Each run writes a plot/PDF, the local phase-folded CSV, and a JSON summary to `LEAPS/outputs/secondary_eclipse/`. A candidate signal is not a confirmation: it requires independent eclipse coverage and should not be interpreted as an albedo measurement without an emission/reflection model. If the observation does not cover phase 0.5, LEAPS records an explicit inconclusive result rather than fitting a false depth.
-
-## Test
-
-```bash
-python -m pip install -e '.[dev]'
-QT_QPA_PLATFORM=offscreen pytest
-```
-
-## Package
-
-Qt's supported `pyside6-deploy` workflow is configured in `pysidedeploy.spec`.
-
-```bash
-bash scripts/build_macos.sh
-```
-
-On Windows PowerShell:
-
-```powershell
-./scripts/build_windows.ps1
-```
-
-Unsigned local artifacts can be built without credentials. Signed release artifacts require the Apple Developer ID/notarization and Windows code-signing secrets documented by the inputs in `.github/workflows/release.yml`. The workflow creates draft GitHub releases so a human can validate installers before publication.
-
-## Design and validation
-
-The approved workspace reference is saved at `docs/design/leaps-plate-solve-reference.png`. The production workspace now replaces the reference's illustrative WTS-2 b field with the project's actual reduced FITS frame and target identity. Rendered implementation comparisons and the design acceptance record are stored in `docs/design/` and `design-qa.md`.
-
-The approved LEAPS logo, application icons, and shared in-app mark are centralized under `leaps/assets/` and generated from `leaps-logo-source.png`.
-
-## Scope
-
-LEAPS v1 is not a broader astronomy suite. Linux installers, Intel Mac builds, blind phase searches, telemetry, and a user-facing CLI are intentionally out of scope. The observing planner remains available under Tools.
-
-This fork retains upstream HOPS scientific code and licensing notices. See [LICENSE](LICENSE). Retired HOPS interface artwork and templates are preserved separately in the [HOPS Archive](<Hops Archive/README.md>).
+For updates and additional information, visit **[LEAPS.software](https://leaps.software)**.
